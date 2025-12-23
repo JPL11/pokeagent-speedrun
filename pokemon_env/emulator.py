@@ -629,7 +629,6 @@ class EmeraldEmulator:
                     self.core.run_frame()
                     
                     # Only find map buffer addresses if we don't have them cached
-                    # This avoids expensive memory scanning on every state load
                     if not self.memory_reader._map_buffer_addr:
                         if not self.memory_reader._find_map_buffer_addresses():
                             logger.warning("Could not find map buffer addresses after state load")
@@ -895,7 +894,8 @@ class EmeraldEmulator:
                     "items": None,
                     "item_count": None,
                     "pokedex_caught": None,
-                    "pokedex_seen": None
+                    "pokedex_seen": None,
+                    "has_pokedex": None
                 },
                 "map": {
                     "tiles": None,
@@ -1005,6 +1005,16 @@ class EmeraldEmulator:
                 logger.warning(f"Failed to read map location: {e}")
         return None
 
+    def get_has_pokedex(self) -> bool:
+        """Check if player has received Pokedex from Birch"""
+        if self.memory_reader:
+            try:
+                flags = self.memory_reader.read_flags()
+                return flags.get("has_pokedex", False)
+            except Exception as e:
+                logger.warning(f"Failed to read Pokedex flag: {e}")
+        return False
+
     def get_money(self) -> Optional[int]:
         """Get current money amount"""
         if self.memory_reader:
@@ -1098,6 +1108,11 @@ class EmeraldEmulator:
     def check_and_update_milestones(self, game_state: Dict[str, Any]):
         """Check current game state and update milestones"""
         try:
+            # Track game state transitions for battle detection
+            current_game_state = game_state.get("game", {}).get("game_state", "overworld")
+            if not hasattr(self, '_prev_game_state'):
+                self._prev_game_state = current_game_state
+            
             # Debug: Show current state
             location = game_state.get("player", {}).get("location", "Unknown")
             # print(f"🔍 Checking milestones for location: {location}")
@@ -1114,7 +1129,7 @@ class EmeraldEmulator:
                 "ROUTE_101", "STARTER_CHOSEN", "BIRCH_LAB_VISITED",
 
                 # Phase 4: Rival
-                "OLDALE_TOWN", "ROUTE_103", "RECEIVED_POKEDEX",
+                "OLDALE_TOWN", "ROUTE_103", "FIRST_RIVAL_BATTLE", "RECEIVED_POKEDEX",
 
                 # Phase 5: Route 102 & Petalburg
                 "ROUTE_102", "PETALBURG_CITY", "DAD_FIRST_MEETING", "GYM_EXPLANATION",
@@ -1129,11 +1144,19 @@ class EmeraldEmulator:
             
             for milestone_id in milestones_to_check:
                 if not self.milestone_tracker.is_completed(milestone_id):
+                    # Debug logging for CLOCK_SET specifically
+                    if milestone_id == "CLOCK_SET":
+                        logger.info(f"⏰ Checking CLOCK_SET milestone...")
+                    
                     if self._check_milestone_condition(milestone_id, game_state):
                         # Check if previous milestone in order is completed before marking this one
                         if self._can_complete_milestone(milestone_id, milestones_to_check):
                             print(f"🎯 Milestone detected: {milestone_id}")
                             self.milestone_tracker.mark_completed(milestone_id)
+            
+            # Update previous game state for next check
+            self._prev_game_state = current_game_state
+            
         except Exception as e:
             logger.warning(f"Error checking milestones: {e}")
 
@@ -1274,36 +1297,75 @@ class EmeraldEmulator:
             elif milestone_id == "PLAYER_HOUSE_ENTERED":
                 if game_state:
                     location = game_state.get("player", {}).get("location", "")
-                    return "LITTLEROOT TOWN BRENDANS HOUSE 1F" in str(location).upper()
+                    gender = game_state.get("player", {}).get("gender", "Boy")
+                    # Brendan (Boy) -> Brendan's House, May (Girl) -> May's House
+                    target_house = "BRENDANS HOUSE" if gender == "Boy" else "MAYS HOUSE"
+                    return f"LITTLEROOT TOWN {target_house} 1F" in str(location).upper()
                 return False
             elif milestone_id == "PLAYER_BEDROOM":
                 if game_state:
                     location = game_state.get("player", {}).get("location", "")
-                    return "LITTLEROOT TOWN BRENDANS HOUSE 2F" in str(location).upper()
+                    gender = game_state.get("player", {}).get("gender", "Boy")
+                    # Brendan (Boy) -> Brendan's House, May (Girl) -> May's House
+                    target_house = "BRENDANS HOUSE" if gender == "Boy" else "MAYS HOUSE"
+                    return f"LITTLEROOT TOWN {target_house} 2F" in str(location).upper()
                 return False
             elif milestone_id == "CLOCK_SET":
-                # Clock is set when player is back in Littleroot Town AFTER visiting the bedroom
+                # Clock setting happens at 2F - player walks UP to wall clock and presses A
+                # In Pokemon Emerald, mom won't let you leave house until clock is set
+                # So if player has left 2F (gone to 1F or outside), clock MUST be set
+                # We trigger this immediately when player leaves the bedroom
                 if game_state:
                     # Must have completed PLAYER_BEDROOM first
                     if not self.milestone_tracker.is_completed("PLAYER_BEDROOM"):
+                        logger.debug("CLOCK_SET: PLAYER_BEDROOM not completed yet")
                         return False
-                    # Must be in Littleroot Town (outside, not in house)
+                    
                     location = game_state.get("player", {}).get("location", "")
                     location_upper = str(location).upper()
-                    # In Littleroot but NOT in either house
-                    return ("LITTLEROOT" in location_upper and
-                            "HOUSE" not in location_upper and
-                            "LAB" not in location_upper)
+                    
+                    # If player is at 1F, they left bedroom so clock is set
+                    # Note: location format has SPACES not underscores: "BRENDANS HOUSE 1F"
+                    if ("BRENDANS" in location_upper or "MAYS" in location_upper) and "1F" in location_upper:
+                        logger.info(f"🕐 CLOCK_SET: Player at {location}, left bedroom - clock is set!")
+                        return True
+                    
+                    # If player is outside (in Littleroot Town), clock is definitely set
+                    if "LITTLEROOT" in location_upper and "HOUSE" not in location_upper:
+                        logger.info(f"🕐 CLOCK_SET: Player outside at {location} - clock is set!")
+                        return True
+                    
                 return False
             elif milestone_id == "RIVAL_HOUSE":
                 if game_state:
                     location = game_state.get("player", {}).get("location", "")
-                    return "LITTLEROOT TOWN MAYS HOUSE 1F" in str(location).upper()
+                    gender = game_state.get("player", {}).get("gender", "Boy")
+                    location_upper = str(location).upper()
+                    
+                    # Rival house depends on player gender:
+                    # Player=Brendan(Boy) -> Rival=May, Player=May(Girl) -> Rival=Brendan
+                    rival_house = "MAYS HOUSE" if gender == "Boy" else "BRENDANS HOUSE"
+                    
+                    return (rival_house in location_upper and 
+                            "1F" in location_upper and 
+                            self.milestone_tracker.is_completed("CLOCK_SET"))
                 return False
             elif milestone_id == "RIVAL_BEDROOM":
                 if game_state:
                     location = game_state.get("player", {}).get("location", "")
-                    return "LITTLEROOT TOWN MAYS HOUSE 2F" in str(location).upper()
+                    gender = game_state.get("player", {}).get("gender", "Boy")
+                    location_upper = str(location).upper()
+                    
+                    # Rival bedroom depends on player gender:
+                    rival_house = "MAYS HOUSE" if gender == "Boy" else "BRENDANS HOUSE"
+
+                    # Note: CLOCK_SET must be completed first
+                    if not self.milestone_tracker.is_completed("CLOCK_SET"):
+                        return False
+                        
+                    if rival_house in location_upper and "2F" in location_upper:
+                        return True
+                    return False
                 return False
                 
             # Phase 3: Professor Birch & Starter milestones
@@ -1334,24 +1396,40 @@ class EmeraldEmulator:
                     location = game_state.get("player", {}).get("location", "")
                     return "ROUTE_103" in str(location).upper() or "ROUTE 103" in str(location).upper()
                 return False
-            # elif milestone_id == "RIVAL_BATTLE_1":
-            #     # Check for specific state hash from dialog after the battle (c9086d56)
-            #     if game_state:
-            #         # Create state hash for comparison
-            #         state_str = str(game_state)
-            #         state_hash = hashlib.md5(state_str.encode()).hexdigest()[:8]
+            
+            elif milestone_id == "FIRST_RIVAL_BATTLE":
+                if game_state:
+                    # Rival battle is complete when player has Pokedex flag set
+                    # (Birch only gives Pokedex after you return from battling rival)
+                    # OR when we detect battle->overworld transition on Route 103
+                    game_info = game_state.get("game", {})
+                    has_pokedex = game_info.get("has_pokedex", False)
                     
-            #         # Check for battle completion state hash or traditional conditions
-            #         return (state_hash == "c9086d56" or 
-            #                 (self.milestone_tracker.is_completed("ROUTE_103") and
-            #                  self.milestone_tracker.is_completed("STARTER_CHOSEN")))
-            #     return False
+                    # If has Pokedex, rival battle is definitely done
+                    if has_pokedex:
+                        return True
+                    
+                    # Alternative: Check if on Route 103 with Pokemon and game transitioned from battle
+                    location = game_state.get("player", {}).get("location", "")
+                    party = game_state.get("player", {}).get("party", [])
+                    game_state_type = game_state.get("game", {}).get("game_state", "")
+                    
+                    # If player is on Route 103 with Pokemon and just exited battle state
+                    if ("ROUTE_103" in str(location).upper() or "ROUTE 103" in str(location).upper()) and len(party) > 0:
+                        # Check if we previously saw battle state (tracked in emulator)
+                        if hasattr(self, '_prev_game_state') and self._prev_game_state == "battle" and game_state_type == "overworld":
+                            return True
+                    
+                    return False
+                return False
+            
             elif milestone_id == "RECEIVED_POKEDEX":
                 if game_state:
-                    # Check if we're in Birch's lab AND have completed Route 103
-                    location = game_state.get("player", {}).get("location", "")
-                    return (self.milestone_tracker.is_completed("ROUTE_103") and 
-                            "LITTLEROOT TOWN PROFESSOR BIRCHS LAB" in str(location).upper())
+                    # Check if player actually has Pokedex flag set in game memory
+                    # This is the most reliable way to detect Pokedex receipt
+                    game_info = game_state.get("game", {})
+                    has_pokedex = game_info.get("has_pokedex", False)
+                    return has_pokedex
                 return False
             ## Phase 5: Route 102 & Petalburg
             elif milestone_id == "ROUTE_102":

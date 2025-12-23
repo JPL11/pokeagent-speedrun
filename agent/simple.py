@@ -42,8 +42,14 @@ from PIL import Image
 
 from utils.state_formatter import format_state_for_llm
 from utils.agent_helpers import update_server_metrics
+from utils.snn_encoder import create_snn_encoder, augment_vlm_prompt_with_snn
+from utils.novelty_detector import create_novelty_detector
 
 logger = logging.getLogger(__name__)
+
+# Global flags to enable features (set via environment variables)
+USE_SNN_ENCODER = os.getenv("USE_SNN_ENCODER", "false").lower() in ("true", "1", "yes")
+USE_NOVELTY_DETECTOR = os.getenv("USE_NOVELTY_DETECTOR", "true").lower() in ("true", "1", "yes")  # Enabled by default!
 
 # Configurable parameters for history tracking
 DEFAULT_MAX_HISTORY_ENTRIES = 100  # Previous states/locations with context
@@ -127,7 +133,7 @@ class SimpleAgent:
     
     def __init__(self, vlm, max_history_entries: int = None, max_recent_actions: int = None, 
                  history_display_count: int = None, actions_display_count: int = None,
-                 movement_memory_clear_interval: int = None):
+                 movement_memory_clear_interval: int = None, use_snn: bool = None):
         self.vlm = vlm
         
         # Use current global defaults if not specified
@@ -147,6 +153,43 @@ class SimpleAgent:
         
         # Movement memory clearing interval
         self.movement_memory_clear_interval = movement_memory_clear_interval
+        
+        # HYBRID ARCHITECTURE: Both SNN + Novelty Detection (can run together!)
+        # SNN Encoder for temporal dynamics (visual patterns)
+        self.use_snn = use_snn if use_snn is not None else USE_SNN_ENCODER
+        self.snn_encoder = None
+        if self.use_snn:
+            try:
+                self.snn_encoder = create_snn_encoder()
+                logger.info("🧠 SNN Encoder ENABLED - Temporal dynamics for visual pattern analysis")
+            except Exception as e:
+                logger.warning(f"Failed to initialize SNN encoder: {e}. Proceeding without SNN.")
+                self.use_snn = False
+        else:
+            logger.info("SNN Encoder disabled (set USE_SNN_ENCODER=true to enable)")
+        
+        # Novelty Detector for exploration (coordinate-based, inspired by PokemonRedExperiments)
+        self.use_novelty = USE_NOVELTY_DETECTOR
+        self.novelty_detector = None
+        if self.use_novelty:
+            try:
+                self.novelty_detector = create_novelty_detector()
+                logger.info("🔍 Novelty Detector ENABLED - Coordinate-based exploration (PokemonRedExperiments)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize novelty detector: {e}. Proceeding without novelty detection.")
+                self.use_novelty = False
+        else:
+            logger.info("Novelty Detector disabled (set USE_NOVELTY_DETECTOR=true to enable)")
+        
+        # Log hybrid architecture status
+        if self.use_snn and self.use_novelty:
+            logger.info("🚀 HYBRID ARCHITECTURE: SNN + Novelty Detection both active!")
+        elif self.use_snn:
+            logger.info("Using SNN Encoder only (visual dynamics)")
+        elif self.use_novelty:
+            logger.info("Using Novelty Detector only (exploration tracking)")
+        else:
+            logger.info("No temporal/novelty features enabled")
         
         # Initialize storyline objectives for Emerald progression
         self._initialize_storyline_objectives()
@@ -858,6 +901,78 @@ Context: {context} | Coords: {coords} """
             print("🤖 END OF SIMPLE AGENT PROMPT")
             print("="*120 + "\n")
             sys.stdout.flush()
+            
+            # SNN Encoder Integration (if enabled) - extract temporal features
+            if self.use_snn and self.snn_encoder is not None:
+                try:
+                    # Convert frame to numpy array if needed
+                    if hasattr(frame, 'size'):  # PIL Image
+                        frame_array = np.array(frame)
+                    else:
+                        frame_array = frame
+                    
+                    # Encode frame and get temporal features
+                    snn_result = self.snn_encoder.encode_frame(frame_array)
+                    snn_summary = self.snn_encoder.get_textual_summary()
+                    
+                    # Augment prompt with SNN temporal dynamics
+                    prompt = f"""{snn_summary}
+
+---
+
+{prompt}"""
+                    
+                    print("🧠 SNN Encoder: Temporal features extracted and added to prompt")
+                    print(f"   Spike Rate: {snn_result['spike_rate']:.3f} Hz")
+                    print(f"   Activity Level: {snn_result['activity_level']:.3f}")
+                    print(f"   Change Detected: {snn_result['change_detected']}")
+                except Exception as e:
+                    logger.warning(f"SNN encoding failed: {e}. Proceeding without SNN features.")
+            
+            # Novelty Detector Integration (inspired by PokemonRedExperiments - much faster!)
+            if self.use_novelty and self.novelty_detector is not None:
+                try:
+                    # Extract coordinates from game_state
+                    coords = game_state.get('coordinates', (0, 0))
+                    map_id = game_state.get('map_id', 0)
+                    dialogue = game_state.get('dialogue', '')
+                    
+                    # Convert frame to numpy array if needed
+                    frame_array = None
+                    if hasattr(frame, 'size'):  # PIL Image
+                        frame_array = np.array(frame)
+                    elif isinstance(frame, np.ndarray):
+                        frame_array = frame
+                    
+                    # Update novelty detector
+                    novelty_result = self.novelty_detector.update(
+                        coords=(coords[0], coords[1], map_id),
+                        frame=frame_array,
+                        dialogue=dialogue
+                    )
+                    
+                    # Get novelty summary
+                    novelty_summary = self.novelty_detector.get_summary()
+                    
+                    # Augment prompt with novelty analysis (prepend for high visibility)
+                    prompt = f"""{novelty_summary}
+
+---
+
+{prompt}"""
+                    
+                    print("🔍 Novelty Detector: Analysis complete")
+                    print(f"   Total Novelty: {novelty_result['total_novelty']:.3f}")
+                    print(f"   Unique Coords: {novelty_result['unique_coords']}")
+                    print(f"   Is Novel: {novelty_result['is_novel']}")
+                    print(f"   Exploration Progress: {novelty_result['exploration_progress']:.1f}")
+                    
+                    # Detect loops
+                    if self.novelty_detector.detect_loop():
+                        print("   ⚠️  LOOP DETECTED - Agent should try something different!")
+                    
+                except Exception as e:
+                    logger.warning(f"Novelty detection failed: {e}. Proceeding without novelty features.")
             
             # Make VLM call - double-check frame validation before VLM
             if frame and (hasattr(frame, 'save') or hasattr(frame, 'shape')):

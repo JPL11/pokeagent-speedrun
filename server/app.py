@@ -69,7 +69,9 @@ running = True
 step_count = 0
 agent_step_count = 0  # Track agent steps separately from frame steps
 current_obs = None
+current_obs = None
 fps = 80
+manual_agent_thought = {}  # Store manual thoughts/strategies from POST /agent
 
 # Performance monitoring
 last_fps_log = time.time()
@@ -503,10 +505,28 @@ def reset_game():
     global env, step_count
     
     print("Resetting game and milestones...")
+    
+    # FORCE DELETE milestone cache before initializing to prevent stale load
+    try:
+        if os.path.exists(".pokeagent_cache/milestones_progress.json"):
+            os.remove(".pokeagent_cache/milestones_progress.json")
+            print("🗑️ Deleted stale milestone cache file")
+    except Exception as e:
+        print(f"⚠️ Failed to delete milestone cache: {e}")
+
     with step_lock:
         env.initialize()
         env.milestone_tracker.reset_all()  # Reset all milestones
         step_count = 0
+        
+        # Clear action queue to prevent phantom inputs from previous run
+        global action_queue, current_action, action_frames_remaining, release_frames_remaining
+        action_queue = []
+        current_action = None
+        action_frames_remaining = 0
+        release_frames_remaining = 0
+        print("🧹 Action queue cleared")
+        
     print("Game and milestone reset complete")
 
 def game_loop(manual_mode=False):
@@ -1297,6 +1317,27 @@ async def stream_agent_thinking():
     
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
+class AgentThoughtRequest(BaseModel):
+    thought: str
+    tasks: list = []
+
+@app.post("/agent")
+async def update_agent_thought(request: Request):
+    """Update agent thinking manually (e.g. from strategy manager)"""
+    global manual_agent_thought
+    try:
+        data = await request.json()
+        manual_agent_thought = {
+            "thought": data.get("thought", ""),
+            "tasks": data.get("tasks", []),
+            "timestamp": time.time()
+        }
+        logger.info(f"Updated manual agent thought: {manual_agent_thought['thought'][:50]}...")
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Error updating agent thought: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/agent")
 async def get_agent_thinking():
     """Get current agent thinking status and recent LLM interactions"""
@@ -1343,14 +1384,26 @@ async def get_agent_thinking():
         logger.info(f"Found {len(recent_interactions)} recent interactions (showing current step only)")
         
         # Format the agent thinking display
+        current_thought = ""
+        
+        # Priority 1: Manual Strategy Message (if recent, e.g. < 10 seconds or always?)
+        # Let's show both if available
+        if manual_agent_thought:
+            current_thought += f"{manual_agent_thought.get('thought', '')}\n\n"
+        
+        # Priority 2: VLM Output
         if recent_interactions:
             interaction = recent_interactions[-1]  # Get the most recent interaction
-            current_thought = f"Current step LLM output:\n"
+            if current_thought:
+                current_thought += f"---\nVLM Output:\n"
+            else:
+                current_thought = f"Current step LLM output:\n"
+                
             duration = interaction.get('duration', 0)
             current_thought += f"{interaction['type'].upper()} ({duration:.2f}s)\n"
             current_thought += f"Response: {interaction['response']}"
-        else:
-            current_thought = "No recent LLM interactions. Agent is ready to process game state."
+        elif not current_thought:
+            current_thought = "No recent LLM interactions or strategy. Agent is ready to process game state."
         
         with step_lock:
             current_step = agent_step_count  # Use agent step count instead of frame step count
@@ -1440,6 +1493,16 @@ latest_metrics = {
 
 # Flag to track whether checkpoint loading should be enabled
 checkpoint_loading_enabled = True  # Will be set based on startup args
+
+@app.post("/reset")
+async def reset_endpoint():
+    """Reset the game state and action queue"""
+    try:
+        reset_game()
+        return {"status": "success", "message": "Game reset complete"}
+    except Exception as e:
+        logger.error(f"Error resetting game: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/reset_metrics")
 async def reset_metrics():

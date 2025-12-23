@@ -285,6 +285,7 @@ class LocalHuggingFaceBackend(VLMBackend):
         except ImportError as e:
             raise ImportError(f"Required packages not found. Install with: pip install torch transformers bitsandbytes accelerate. Error: {e}")
         
+        self.log_backend_interactions = kwargs.pop('log_backend_interactions', True)
         self.model_name = model_name
         self.device = device
         self.torch = torch
@@ -365,17 +366,23 @@ class LocalHuggingFaceBackend(VLMBackend):
                     result = generated_text.split(text)[-1].strip()
                 else:
                     result = generated_text.strip()
+                
+                # Remove "assistant" prefix that chat templates add
+                if result.startswith("assistant"):
+                    result = result[len("assistant"):].strip()
+                if result.startswith("\n"):
+                    result = result.lstrip("\n")
             
-            # Log the interaction
             duration = time.time() - start_time
-            log_llm_interaction(
-                interaction_type=f"local_{module_name}",
-                prompt=text,
-                response=result,
-                duration=duration,
-                metadata={"model": self.model_name, "backend": "local", "has_image": "images" in inputs},
-                model_info={"model": self.model_name, "backend": "local"}
-            )
+            if self.log_backend_interactions:
+                log_llm_interaction(
+                    interaction_type=f"local_{module_name}",
+                    prompt=text,
+                    response=result,
+                    duration=duration,
+                    metadata={"model": self.model_name, "backend": "local", "has_image": "images" in inputs},
+                    model_info={"model": self.model_name, "backend": "local"}
+                )
             
             # Log the response
             result_preview = result[:1000] + "..." if len(result) > 1000 else result
@@ -812,6 +819,38 @@ class GeminiBackend(VLMBackend):
             # Return a safe default response
             logger.warning(f"[{module_name}] Returning default response due to error: {e}")
             return "I encountered an error processing the request. I'll proceed with a basic action: press 'A' to continue."
+
+
+def create_vlm(backend: str = "qwen", **kwargs):
+    """
+    Factory function to create VLM instances with common backend configurations.
+    
+    Args:
+        backend: Backend type ('qwen', 'gemini', 'claude', 'gpt', 'openai')
+        **kwargs: Additional arguments passed to VLM constructor
+    
+    Returns:
+        VLM instance configured for the specified backend
+    """
+    backend_configs = {
+        'qwen': {'model_name': 'qwen-vl-plus', 'backend': 'openai'},
+        'qwen2b': {'model_name': 'Qwen/Qwen2-VL-2B-Instruct', 'backend': 'local'},
+        'local': {'model_name': 'Qwen/Qwen2-VL-2B-Instruct', 'backend': 'local'},
+        'gemini': {'model_name': 'gemini-pro-vision', 'backend': 'gemini'},
+        'claude': {'model_name': 'claude-3-5-sonnet-20241022', 'backend': 'openai'},
+        'gpt': {'model_name': 'gpt-4o-mini', 'backend': 'openai'},
+        'openai': {'model_name': 'gpt-4o-mini', 'backend': 'openai'},
+    }
+    
+    if backend.lower() not in backend_configs:
+        logger.warning(f"Unknown backend '{backend}', defaulting to gpt-4o-mini")
+        backend = 'gpt'
+    
+    config = backend_configs[backend.lower()]
+    config.update(kwargs)
+    
+    return VLM(**config)
+
 
 class VLM:
     """Main VLM class that supports multiple backends"""

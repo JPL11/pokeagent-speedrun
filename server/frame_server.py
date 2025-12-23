@@ -152,4 +152,4 @@ if __name__ == "__main__":
     frame_thread.start()
     
     # Start server
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")

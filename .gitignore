@@ -189,3 +189,24 @@ cython_debug/
 
 *.mp4
 .pokeagent_cache/*
+
+# Process IDs
+*.pid
+.*.pid
+
+# Training Logs and Data
+.training.logfile
+nohup.out
+frame*.json
+cache/
+
+# Checkpoints
+.rl_checkpoints/
+archive_checkpoints/
+checkpoints/
+checkpoints_*/
+tensorboard_server_aware/
+
+# External Binaries
+mGBA-0.10.5-ubuntu64-focal/
+mGBA-0.10.5-ubuntu64-focal.tar.xz

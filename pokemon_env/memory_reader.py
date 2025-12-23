@@ -59,6 +59,7 @@ class MemoryAddresses:
     GAME_STATE = 0x03005074
     MENU_STATE = 0x03005078
     DIALOG_STATE = 0x020370B8
+    OVERWORLD_FREEZE = 0x02022B4C  # Player movement freeze state (0=can move, non-zero=frozen)
     IN_BATTLE_FLAG = 0x030026F9
     IN_BATTLE_MASK = 0x02
     
@@ -386,6 +387,21 @@ class PokemonEmeraldReader:
         except Exception as e:
             logger.warning(f"Failed to read player name: {e}")
             return "Player"
+
+    def read_player_gender(self) -> str:
+        """Read player gender from Save Block 2 (0=Boy, 1=Girl)"""
+        try:
+            # Get SaveBlock2 pointer
+            save_block_2_ptr = self._read_u32(self.addresses.SAVE_BLOCK2_PTR)
+            if save_block_2_ptr == 0:
+                return "Boy" # Default
+                
+            # Gender is at offset 0x08 (after 8 bytes of name)
+            gender_byte = self._read_u8(save_block_2_ptr + 0x08)
+            return "Girl" if gender_byte == 1 else "Boy"
+        except Exception as e:
+            logger.warning(f"Failed to read player gender: {e}")
+            return "Boy"
 
     def read_money(self) -> int:
         """Read player's money with proper decryption"""
@@ -826,6 +842,18 @@ class PokemonEmeraldReader:
         Enhanced with residual text filtering to prevent false positives.
         """
         try:
+            # CRITICAL FIX (Nov 23): Check if player movement is frozen
+            # If player can move, they're NOT in dialog (even if residual flags/text exist)
+            try:
+                overworld_freeze = self._read_u8(self.addresses.OVERWORLD_FREEZE)
+                # If overworld is NOT frozen (0 = can move), player is free to walk
+                # This is the most reliable indicator - dialog ALWAYS freezes movement
+                if overworld_freeze == 0:
+                    logger.debug("Player can move (overworld not frozen) - NOT in dialog despite residual data")
+                    return False
+            except Exception:
+                pass  # Fall back to other checks if this fails
+            
             # First check for residual battle/escape text that should be ignored
             dialog_text = self.read_dialog()
             if dialog_text:
@@ -866,12 +894,22 @@ class PokemonEmeraldReader:
                 is_signpost = self._read_u8(self.addresses.MSG_IS_SIGNPOST)
                 box_cancelable = self._read_u8(self.addresses.MSG_BOX_CANCELABLE)
                 
+                # FIX (Nov 23): Only consider signpost dialog if BOTH conditions are met:
+                # 1. Flag is set AND 2. We have actual dialog text (not residual)
+                # This prevents stuck "dialog" state after reading signs
+                has_active_text = dialog_text and len(dialog_text.strip()) > 5
+                
                 # Only consider valid if values are reasonable (not 0xFF which indicates uninitialized)
-                if (is_signpost != 0 and is_signpost != 0xFF and is_signpost <= 10):
-                    logger.debug(f"Message box dialog detected: signpost={is_signpost}")
+                # AND we have active dialog text to display
+                if (is_signpost != 0 and is_signpost != 0xFF and is_signpost <= 10 and has_active_text):
+                    # Additional check: is this just a sign name? (signs are < 30 chars usually)
+                    if len(dialog_text.strip()) < 30:
+                        logger.debug(f"Ignoring short signpost text (likely residual): '{dialog_text[:30]}'")
+                        return False
+                    logger.debug(f"Message box dialog detected: signpost={is_signpost}, text='{dialog_text[:30]}'")
                     return True
                     
-                if (box_cancelable != 0 and box_cancelable != 0xFF and box_cancelable <= 10):
+                if (box_cancelable != 0 and box_cancelable != 0xFF and box_cancelable <= 10 and has_active_text):
                     logger.debug(f"Message box dialog detected: cancelable={box_cancelable}")
                     return True
             except Exception:
@@ -1509,15 +1547,44 @@ class PokemonEmeraldReader:
                     logger.debug("Standard methods failed, checking known opponent addresses")
                     opponent_data = self._check_known_opponent_addresses()
                 
-                # Method 4: Dynamic memory scanning as last resort
-                # if not opponent_data:
-                #     logger.debug("All methods failed, trying memory scan")
-                #     opponent_data = self._scan_for_opponent_pokemon()
+                # Assign found data
+                if opponent_data:
+                    enhanced_battle["opponent_pokemon"] = opponent_data
+                    enhanced_battle["opponent_status"] = "Active"
                 
-                # Opponent detection disabled - feature not working correctly
-                enhanced_battle["opponent_pokemon"] = None
-                enhanced_battle["opponent_status"] = "Opponent detection disabled (feature not reliable)"
-                logger.debug("Opponent detection disabled due to incorrect readings")
+                # Heuristic for Battle Type (Wild vs Trainer) & Map-Awareness
+                try:
+                    # Read basic map info for heuristics
+                    map_bank = self._read_u8(self.addresses.MAP_BANK)
+                    map_num = self._read_u8(self.addresses.MAP_NUMBER)
+                    map_id = (map_bank << 8) | map_num
+                    
+                    # Direct level read for heuristic (fallback if opponent_data missing)
+                    g_enemy_party_base = 0x02023BC0
+                    heuristic_level = self._read_u8(g_enemy_party_base + 0x54) 
+                    
+                    # If we have opponent_data, use its level (detected from decrypted/parsed data)
+                    if opponent_data and 'level' in opponent_data:
+                        heuristic_level = opponent_data['level']
+                    
+                    is_wild = True # Default assumption
+                    
+                    if map_id == 0x12: # Route 103
+                        # Rival Heuristic: Level 5 Enocunter
+                        if heuristic_level >= 5:
+                            is_wild = False
+                            logger.info(f"⚔️ Heuristic: Route 103 lvl {heuristic_level} -> RIVAL TRAINER identified")
+                        else:
+                            is_wild = True
+                            logger.info(f"🌿 Heuristic: Route 103 lvl {heuristic_level} -> WILD Pokemon identified")
+                    elif map_id == 0x10: # Route 101
+                        is_wild = True # Always wild
+                        
+                    enhanced_battle["is_wild_battle"] = is_wild
+                    enhanced_battle["is_trainer_battle"] = not is_wild
+                    
+                except Exception as h_err:
+                    logger.warning(f"Heuristic battle type detection failed: {h_err}")
                             
             except Exception as e:
                 logger.warning(f"Failed to read opponent battle Pokémon: {e}")
@@ -2461,7 +2528,8 @@ class PokemonEmeraldReader:
                 "items": self.read_items(),
                 "item_count": self.read_item_count(),
                 "pokedex_caught": self.read_pokedex_caught_count(),
-                "pokedex_seen": self.read_pokedex_seen_count()
+                "pokedex_seen": self.read_pokedex_seen_count(),
+                "has_pokedex": self.read_flags().get("has_pokedex", False)
             })
             
             # Battle details - use comprehensive battle info
@@ -2536,9 +2604,11 @@ class PokemonEmeraldReader:
                     }
                     for pokemon in party
                 ]
+                state["player"]["party_size"] = len(party)
                 logger.info(f"Added {len(state['player']['party'])} Pokemon to state")
                 logger.info(f"Final state party: {state['player']['party']}")
             else:
+                state["player"]["party_size"] = 0
                 self._rate_limited_warning("No Pokemon found in party", "party_empty")
         
                 
@@ -4866,3 +4936,67 @@ class PokemonEmeraldReader:
         
         state_formatter.MAP_STITCHER_SAVE_CALLBACK = save_callback
             # print( Set up location connections save callback")
+    
+    def get_player_identity(self):
+        """🎭 IDENTITY LEARNING SYSTEM - Read player identity from memory (GROUND TRUTH)
+        
+        This replaces fragile milestone-based inference with direct memory reading.
+        Player gender is set during intro and stored at 0x0202573B.
+        
+        Returns:
+            dict: {
+                'gender': 0 or 1,                    # 0=male, 1=female  
+                'gender_name': 'male' or 'female',
+                'character': 'Brendan' or 'May',     # Player character name
+                'rival_character': 'May' or 'Brendan', # Rival is opposite gender
+                'name': str,                         # Player's chosen name (if readable)
+                'verification': str                  # Source of truth
+            } or None if memory read fails
+        
+        Architecture:
+            Memory Address → Identity Context → VLM Prompt
+            0x0202573B → gender=0 (male) → "You are Brendan (male), rival is May"
+        
+        This eliminates hallucination by providing ground truth instead of inference.
+        """
+        try:
+            # Read player gender from memory (set during intro cutscene)
+            gender = self._read_u8(self.addresses.PLAYER_GENDER)
+            
+            # Gender mapping (from Pokemon Emerald game code)
+            # 0 = Male (player is Brendan, rival is May)
+            # 1 = Female (player is May, rival is Brendan)
+            
+            if gender not in [0, 1]:
+                logger.warning(f"Invalid gender value: {gender}. May be in intro cutscene.")
+                return None
+            
+            character = 'Brendan' if gender == 0 else 'May'
+            rival = 'May' if gender == 0 else 'Brendan'
+            gender_name = 'male' if gender == 0 else 'female'
+            
+            # Try to read player name (7-byte Pokemon text encoding)
+            # This might fail if in early game before name is set
+            player_name = "Unknown"
+            try:
+                name_bytes = self._read_bytes(self.addresses.PLAYER_NAME, 7)
+                if name_bytes and any(b != 0 for b in name_bytes):
+                    player_name = self._decode_pokemon_text(name_bytes)
+            except Exception as e:
+                logger.debug(f"Could not read player name: {e}")
+            
+            identity = {
+                'gender': gender,
+                'gender_name': gender_name,
+                'character': character,
+                'rival_character': rival,
+                'name': player_name,
+                'verification': f'Memory 0x0202573B: gender={gender}'
+            }
+            
+            logger.debug(f"🎭 Player identity: {character} ({gender_name}), rival: {rival}")
+            return identity
+            
+        except Exception as e:
+            logger.error(f"Failed to read player identity from memory: {e}")
+            return None

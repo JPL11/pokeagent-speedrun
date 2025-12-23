@@ -1,0 +1,21 @@
+# Reinforcement Learning Dependencies
+# Install with: pip install -r requirements_rl.txt
+
+# Core RL library
+stable-baselines3>=2.0.0
+
+# Deep learning framework
+torch>=2.0.0
+
+# Visualization
+tensorboard>=2.14.0
+
+# Optional: Advanced RL features
+# stable-baselines3[extra]>=2.0.0  # For extra algorithms
+
+# Gym environment (should already be installed)
+gymnasium>=0.28.0
+
+# Numpy (should already be installed)
+numpy>=1.24.0
+
