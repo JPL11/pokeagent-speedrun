@@ -885,13 +885,23 @@ async def get_comprehensive_state():
         # This avoids expensive operations on rapid requests
         state = env.get_comprehensive_state()
         
-        # Ensure game state is consistent with cached dialog state
-        # Use the same cached dialog state as the status endpoint
+        # Ensure game state is consistent - check BATTLE first, then dialog, then overworld
         is_dialog = env._cached_dialog_state if env else False
-        if is_dialog:
+        
+        # Check battle state FIRST (highest priority)
+        is_in_battle = False
+        try:
+            if env and env.memory_reader:
+                is_in_battle = env.memory_reader.is_in_battle()
+        except Exception as e:
+            logger.debug(f"Failed to check battle state: {e}")
+        
+        # Set game_state: battle > dialog > overworld
+        if is_in_battle:
+            state["game"]["game_state"] = "battle"
+        elif is_dialog:
             state["game"]["game_state"] = "dialog"
         else:
-            # Force overworld if not in dialog (respect 5-second timeout)
             state["game"]["game_state"] = "overworld"
         
         # Include milestones for storyline objective auto-completion

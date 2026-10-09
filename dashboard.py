@@ -37,7 +37,8 @@ def get_training_stats():
         # Fallback to finding newest file
         log_files = glob.glob('training_logs/training_*.log') + \
                     glob.glob('training_*.log') + \
-                    (['training.log'] if os.path.exists('training.log') else [])
+                    (['training.log'] if os.path.exists('training.log') else []) + \
+                    (['training_output.log'] if os.path.exists('training_output.log') else [])
         
         if not log_files:
             stats['error'] = 'No training log file found'
@@ -53,26 +54,23 @@ def get_training_stats():
             
             import re
             
-            # Find current step (try multiple patterns)
-            max_step = 0
-            for line in lines:
-                # Pattern 1: "Step 100:" or "🔍 Step 100:" or "Step 100 |" or "Step 100)"
-                if match := re.search(r'Step\s+(\d+)[:\|\)]', line, re.IGNORECASE):
-                    step = int(match.group(1))
-                    max_step = max(max_step, step)
+            # Find MOST RECENT step (last step line, not max!)
+            # Scan in reverse to find the latest step
+            current_step = 0
+            for line in reversed(list(lines)):
+                # Pattern 1: "Step 100:" or "Step 100 |"
+                if match := re.search(r'Step\s+(\d+)[:\|]', line):
+                    current_step = int(match.group(1))
+                    break
                 # Pattern 2: "total_timesteps | 64"
                 elif 'total_timesteps' in line:
                     if match := re.search(r'total_timesteps\s+\|\s+(\d+)', line):
-                        step = int(match.group(1))
-                        max_step = max(max_step, step)
-                # Pattern 3: "step 100," (lowercase, in parentheses)
-                elif match := re.search(r'step\s+(\d+)[,\s]', line, re.IGNORECASE):
-                    step = int(match.group(1))
-                    max_step = max(max_step, step)
+                        current_step = int(match.group(1))
+                        break
             
-            if max_step > 0:
-                stats['current_step'] = f"{max_step:,}"
-                stats['progress_pct'] = (max_step / 2000000) * 100
+            if current_step > 0:
+                stats['current_step'] = f"{current_step:,}"
+                stats['progress_pct'] = (current_step / 2000000) * 100
             
             # Recent reward
             for line in reversed(lines):

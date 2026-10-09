@@ -429,6 +429,13 @@ class MapStitcher:
         if not from_area or not to_area:
             return
         
+        # IMPORTANT FIX: Find the actual warp tile, not the player's pre-warp position
+        # When player walks from (8,2) UP into stairs at (7,1), we want (7,1) not (8,2)
+        actual_warp_pos = self._find_actual_warp_tile(from_area, from_pos)
+        if actual_warp_pos:
+            logger.info(f"🎯 Found actual warp tile at {actual_warp_pos} (player was at {from_pos})")
+            from_pos = actual_warp_pos
+        
         # Determine warp type and direction
         warp_type = "route_transition"  # default
         direction = self._determine_warp_direction(from_area, to_area, from_pos, to_pos)
@@ -461,6 +468,89 @@ class MapStitcher:
                 if not self._connection_exists(reverse):
                     self.warp_connections.append(reverse)
                     logger.debug(f"Added reverse connection: {to_area.location_name} -> {from_area.location_name}")
+    
+    def _find_actual_warp_tile(self, from_area: MapArea, player_pos: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+        """Find the actual warp tile near the player's position.
+        
+        When a warp triggers, the player was standing at player_pos but the actual
+        warp tile (door, stairs, etc.) is likely 1 tile adjacent to them in the
+        direction they were moving.
+        
+        Returns the warp tile position if found, otherwise None.
+        """
+        px, py = player_pos
+        loc_name = from_area.location_name.upper() if from_area.location_name else ""
+        
+        # Check if we have warp_tiles detected for this area
+        if from_area.warp_tiles:
+            # First, check all adjacent tiles (including the player's position)
+            for dx in range(-1, 2):
+                for dy in range(-1, 2):
+                    check_x, check_y = px + dx, py + dy
+                    warp_type = from_area.has_warp_at(check_x, check_y)
+                    if warp_type:
+                        logger.debug(f"Found warp tile '{warp_type}' at ({check_x}, {check_y}) near player at {player_pos}")
+                        return (check_x, check_y)
+        
+        # If no warp_tiles list, try to detect from map_data
+        if from_area.map_data:
+            # Get offset if using accumulated map
+            offset_x = from_area.origin_offset.get('x', 0) if hasattr(from_area, 'origin_offset') and from_area.origin_offset else 0
+            offset_y = from_area.origin_offset.get('y', 0) if hasattr(from_area, 'origin_offset') and from_area.origin_offset else 0
+            
+            # Check adjacent tiles in map data for warp behaviors
+            for dx in range(-1, 2):
+                for dy in range(-1, 2):
+                    if dx == 0 and dy == 0:
+                        continue  # Skip player's own position in second pass
+                    
+                    check_x, check_y = px + dx, py + dy
+                    grid_x, grid_y = check_x + offset_x, check_y + offset_y
+                    
+                    # Bounds check
+                    if 0 <= grid_y < len(from_area.map_data) and 0 <= grid_x < len(from_area.map_data[grid_y]):
+                        tile = from_area.map_data[grid_y][grid_x]
+                        if tile and len(tile) >= 2:
+                            behavior = tile[1]
+                            behavior_name = ""
+                            
+                            if hasattr(behavior, 'name'):
+                                behavior_name = behavior.name
+                            elif isinstance(behavior, int):
+                                try:
+                                    behavior_enum = MetatileBehavior(behavior)
+                                    behavior_name = behavior_enum.name
+                                except ValueError:
+                                    continue
+                            
+                            # Check for warp-type behaviors
+                            if any(kw in behavior_name for kw in ["DOOR", "STAIRS", "WARP", "ENTRANCE"]):
+                                logger.debug(f"Found warp behavior '{behavior_name}' at ({check_x}, {check_y})")
+                                return (check_x, check_y)
+        
+        # === HEURISTIC FALLBACK: Use location-specific known positions ===
+        # Pokémon houses follow standard layouts - use this knowledge when tile detection fails
+        
+        # 2F → 1F transitions: Stairs are typically UP from player position
+        if "2F" in loc_name or "BEDROOM" in loc_name:
+            # In most houses, player walks UP into stairs at y-1 from their position
+            # Stairs are in the northwest corner of most 2F layouts
+            # Check if there's a tile one UP that makes sense
+            if py > 0:
+                possible_stair = (px, py - 1)
+                logger.info(f"🎯 HEURISTIC: 2F stairs likely at {possible_stair} (player was at {player_pos})")
+                return possible_stair
+        
+        # 1F → exterior transitions: Door is typically DOWN from player position
+        elif "1F" in loc_name and "HOUSE" in loc_name:
+            # In most houses, player walks DOWN into door at y+1 from their position
+            if py >= 0:
+                possible_door = (px, py + 1)
+                logger.info(f"🎯 HEURISTIC: 1F door likely at {possible_door} (player was at {player_pos})")
+                return possible_door
+        
+        # No warp tile found - return None (will use player pos as fallback)
+        return None
     
     def _determine_warp_direction(self, from_area: MapArea, to_area: MapArea,
                                 from_pos: Tuple[int, int], to_pos: Tuple[int, int]) -> str:

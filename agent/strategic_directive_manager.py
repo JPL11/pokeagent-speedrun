@@ -68,7 +68,7 @@ class StrategicDirectiveManager:
             return [k for k, v in milestones.items() if v.get('completed', False)]
         return []
 
-    def update_directive(self, party_state, milestones_completed, location, step_count, gender="Boy", has_pokedex=False):
+    def update_directive(self, party_state, milestones_completed, location, step_count, gender="Boy", has_pokedex=False, rival_battle_won=False):
         """
         Update strategic directive based on current game state.
         Called every VLM invocation (~25 steps).
@@ -204,16 +204,17 @@ class StrategicDirectiveManager:
         
         # PRIORITY 0.5: RIVAL ARC (Starter Get -> Pokedex Get)
         # User requested specific railroading: Littleroot -> 101 -> Oldale -> 103 -> Rival -> Lab -> Pokedex
-        # NO SKIPPING STEPS! Must battle rival BEFORE going to lab for Pokedex!
-        # CRITICAL: Use has_starter which checks milestones too!
-        # ALSO CHECK: If no rival battle yet, we're still in early game regardless of RECEIVED_POKEDEX!
-        rival_battled = 'FIRST_RIVAL_BATTLE' in implied_milestones
+        # NO SKIPPING STEPS! Must WIN rival battle BEFORE going to lab for Pokedex!
+        # CRITICAL: Use rival_battle_won parameter (not just milestone) to distinguish win from loss
+        # The FIRST_RIVAL_BATTLE milestone triggers on battle START, but we need VICTORY!
+        rival_battled = rival_battle_won  # Use the explicit win flag, not the milestone
         still_in_early_game = has_starter and (not rival_battled or 'RECEIVED_POKEDEX' not in implied_milestones)
         
         if still_in_early_game:
              
-             # Check if rival battle completed
-             rival_battled = 'FIRST_RIVAL_BATTLE' in implied_milestones
+             # Check if rival battle WON (not just fought)
+             # rival_battled already set from rival_battle_won parameter above
+
              
              # EMERGENCY HEAL CHECK: If HP is low, go to PokeCenter/Mom first!
              if party_state and len(party_state) > 0:
@@ -260,9 +261,12 @@ class StrategicDirectiveManager:
                   # If in lab during Phase 1, exit immediately - don't get Pokedex yet!
                   if 'LAB' in location_upper or 'PROFESSOR' in location_upper:
                        return self._get_directive_info('PROCEED', 'EXIT_LAB_GO_FIND_RIVAL', 10)
-                  # If in player's house, exit first
-                  if 'PLAYER' in location_upper or 'BRENDAN' in location_upper:
-                       return self._get_directive_info('PROCEED', 'EXIT_HOUSE_GO_DOWN', 10)
+                  # If in player's house or ANY Littleroot house, exit first with explicit objective
+                  if 'PLAYER' in location_upper or 'BRENDAN' in location_upper or ('HOUSE' in location_upper and 'LITTLEROOT' in location_upper):
+                       # Set explicit EXIT_HOUSE_FIRST objective so VLM sees immediate step
+                       return self._get_directive_info('PROCEED', 'EXIT_HOUSE_FIRST', 10, 
+                                                      current_target='ROUTE_103_RIVAL', 
+                                                      objective='EXIT_HOUSE_FIRST')
                   if 'LITTLEROOT' in location_upper:
                        return self._get_directive_info('PROCEED', 'GO_NORTH_TO_ROUTE_101', 10)
                   if 'ROUTE' in location_upper and '101' in location_upper:
@@ -324,26 +328,54 @@ class StrategicDirectiveManager:
                  if 'LAB' in location_upper:
                       return self._get_directive_info('INTERACT', 'TALK_TO_BIRCH', 10)
         
-        # POST-POKEDEX: Continue journey north (Route 101 → Oldale → Route 102 → Petalburg)
+        # POST-POKEDEX: Continue journey (Route 103 → Oldale → Route 102 → Petalburg)
         if has_pokedex and party_state and len(party_state) > 0:
+            # UNIVERSAL HP CHECK - HEAL takes priority over navigation!
+            party_hp = sum(p.get('hp', p.get('current_hp', 0)) for p in party_state if p)
+            party_max = sum(p.get('max_hp', 1) for p in party_state if p) or 1
+            hp_ratio = party_hp / party_max
+            
+            # Debug logging
+            if step_count % 50 == 0:
+                logger.info(f"🏥 DIRECTIVE HP CHECK: {party_hp}/{party_max} = {hp_ratio*100:.0f}% | has_pokedex={has_pokedex}")
+            
+            if hp_ratio < 0.50:  # HP below 50% - MUST HEAL!
+                if 'POKECENTER' in location_upper:
+                    return self._get_directive_info('HEAL', 'TALK_TO_NURSE_JOY', 10)
+                elif 'ROUTE' in location_upper and '103' in location_upper:
+                    return self._get_directive_info('HEAL', 'GO_SOUTH_TO_OLDALE_POKECENTER', 10)
+                elif 'ROUTE' in location_upper and '102' in location_upper:
+                    return self._get_directive_info('HEAL', 'GO_EAST_TO_OLDALE_POKECENTER', 10)
+                elif 'ROUTE' in location_upper and '101' in location_upper:
+                    return self._get_directive_info('HEAL', 'GO_NORTH_TO_OLDALE_POKECENTER', 10)
+                elif 'OLDALE' in location_upper:
+                    return self._get_directive_info('HEAL', 'VISIT_OLDALE_POKECENTER', 10)
+                elif 'LITTLEROOT' in location_upper:
+                    return self._get_directive_info('HEAL', 'GO_NORTH_TO_OLDALE_POKECENTER', 10)
+                else:
+                    return self._get_directive_info('HEAL', 'FIND_NEAREST_POKECENTER', 10)
+            
             # Exit lab if still inside
             if 'LAB' in location_upper:
                 return self._get_directive_info('PROCEED', 'EXIT_LAB_GO_NORTH', 10)
             # Exit house if in one
             if 'HOUSE' in location_upper or 'BEDROOM' in location_upper:
                 return self._get_directive_info('PROCEED', 'EXIT_HOUSE_GO_DOWN', 10)
+            # On Route 103 after Pokédex - go SOUTH to Oldale, then WEST to Route 102!
+            if 'ROUTE' in location_upper and '103' in location_upper:
+                return self._get_directive_info('PROCEED', 'GO_SOUTH_TO_OLDALE', 10)
+            # In Oldale, go WEST to Route 102
+            if 'OLDALE' in location_upper:
+                return self._get_directive_info('PROCEED', 'GO_WEST_TO_ROUTE_102', 10)
+            # On Route 102, continue WEST to Petalburg
+            if 'ROUTE' in location_upper and '102' in location_upper:
+                return self._get_directive_info('PROCEED', 'GO_WEST_TO_PETALBURG', 10)
+            # On Route 101, go NORTH to Oldale (then west to Route 102)
+            if 'ROUTE' in location_upper and '101' in location_upper:
+                return self._get_directive_info('PROCEED', 'GO_NORTH_TO_OLDALE', 10)
             # In Littleroot Town, go north to Route 101
             if 'LITTLEROOT' in location_upper:
                 return self._get_directive_info('PROCEED', 'GO_NORTH_ROUTE_101', 10)
-            # In Littleroot, go north to Route 101
-            if 'LITTLEROOT' in location_upper:
-                return self._get_directive_info('PROCEED', 'GO_NORTH_TO_ROUTE_101_CONTINUE', 10)
-            # On Route 101, go north to Oldale
-            if 'ROUTE' in location_upper and '101' in location_upper:
-                return self._get_directive_info('PROCEED', 'GO_NORTH_TO_OLDALE', 10)
-            # In Oldale, go west to Route 102
-            if 'OLDALE' in location_upper:
-                return self._get_directive_info('PROCEED', 'GO_WEST_TO_ROUTE_102', 10)
         
         # Calculate party stats
         party_levels = [p.get('level', 0) for p in party_state if p]
@@ -463,14 +495,19 @@ class StrategicDirectiveManager:
         
         return self._get_directive_info(new_directive, reason, target_level, should_transition)
     
-    def _get_directive_info(self, directive, reason, target_level=10, should_transition=False):
+    def _get_directive_info(self, directive, reason, target_level=10, should_transition=False, current_target=None, objective=None):
         """Return directive information dict."""
-        return {
+        result = {
             'directive': directive,
             'reason': reason,
             'target_level': target_level,
             'should_transition': should_transition
         }
+        if current_target is not None:
+            result['current_target'] = current_target
+        if objective is not None:
+            result['objective'] = objective
+        return result
     
     def record_level_gain(self, new_level):
         """Track level gains during grinding sessions."""

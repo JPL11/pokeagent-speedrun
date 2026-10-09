@@ -547,6 +547,24 @@ class PokemonEmeraldReader:
                     return True
             except Exception:
                 pass  # Battle type flags check is supplementary
+            
+            # TERTIARY: Check if gEnemyParty has valid opponent data
+            # This is more reliable - if there's a valid enemy Pokemon, we're in battle
+            try:
+                g_enemy_party_base = 0x02023BC0  # gEnemyParty base address
+                enemy_species = self._read_u16(g_enemy_party_base + 0x20)
+                enemy_level = self._read_u8(g_enemy_party_base + 0x54)
+                enemy_hp = self._read_u16(g_enemy_party_base + 0x56)
+                enemy_max_hp = self._read_u16(g_enemy_party_base + 0x58)
+                
+                # Valid enemy Pokemon = we're in battle!
+                if (1 <= enemy_species <= 411 and 
+                    1 <= enemy_level <= 100 and 
+                    enemy_max_hp > 0 and enemy_hp <= enemy_max_hp):
+                    logger.debug(f"Battle detected via gEnemyParty: Species {enemy_species} Lv{enemy_level} HP {enemy_hp}/{enemy_max_hp}")
+                    return True
+            except Exception:
+                pass  # gEnemyParty check is supplementary
                 
             return False
         except Exception as e:
@@ -1026,6 +1044,22 @@ class PokemonEmeraldReader:
             return False, f"Area is mostly impassable: {impassable_ratio:.1%}"
         
         return True, f"Map validation passed: {walkable_ratio:.1%} walkable, {wall_ratio:.1%} walls, {special_ratio:.1%} special, {impassable_ratio:.1%} impassable"
+
+    def get_current_map_id_hex(self) -> str:
+        """Get current map ID as hex string (ground truth from emulator memory).
+        
+        Returns:
+            Hex string like '0010' for Route 101, '0011' for Oldale Town, etc.
+            Returns None if unable to read from memory.
+        """
+        try:
+            map_bank = self._read_u8(self.addresses.MAP_BANK)
+            map_number = self._read_u8(self.addresses.MAP_NUMBER)
+            map_id = (map_bank << 8) | map_number
+            return f"{map_id:04X}"
+        except Exception as e:
+            logger.debug(f"Failed to read map_id from memory: {e}")
+            return None
 
     def read_coordinates(self) -> Tuple[int, int]:
         """Read player coordinates"""
@@ -2513,10 +2547,15 @@ class PokemonEmeraldReader:
             if player_name:
                 state["player"]["name"] = player_name
             
+            # Add player gender for navigation (Boy=Brendan, Girl=May)
+            player_gender = self.read_player_gender()
+            state["player"]["gender"] = player_gender
+            
             # Player facing direction - removed as it's often unreliable
             # facing = self.read_player_facing()
             # if facing:
             #     state["player"]["facing"] = facing
+
             
             # Game information
             state["game"].update({

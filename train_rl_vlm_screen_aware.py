@@ -16,6 +16,7 @@ import base64
 from io import BytesIO
 from pathlib import Path
 from PIL import Image
+from typing import Optional, Tuple, List, Dict
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
@@ -51,7 +52,7 @@ def get_map_name(map_id):
     """Convert map ID to readable name"""
     return MAP_NAMES.get(map_id, f"UNKNOWN_MAP_0x{map_id:04X}")
 
-def _get_story_context(completed, location_name, party_size, has_pokedex_flag=False):
+def _get_story_context(completed, location_name, party_size, has_pokedex_flag=False, lead_level=5):
     """
     Get current story context and next milestone goal
     Uses both milestone flags AND game state (location, party, pokedex) for accuracy
@@ -62,20 +63,67 @@ def _get_story_context(completed, location_name, party_size, has_pokedex_flag=Fa
     at_route_101 = "ROUTE" in location_name and "101" in location_name
     at_town = "LITTLEROOT" in location_name and not at_lab
     
+    # Detect player house locations (May's house = female player, Brendan's house = male player)
+    at_player_house_1f = ("MAYS HOUSE 1F" in location_name or "BRENDANS HOUSE 1F" in location_name or 
+                          "MAY HOUSE 1F" in location_name or "BRENDAN HOUSE 1F" in location_name)
+    at_player_house_2f = ("MAYS HOUSE 2F" in location_name or "BRENDANS HOUSE 2F" in location_name or
+                          "MAY HOUSE 2F" in location_name or "BRENDAN HOUSE 2F" in location_name or
+                          "PLAYER BEDROOM" in location_name)
+    at_rival_house = ("RIVAL" in location_name.upper() or 
+                      ("MAYS" not in location_name and "BRENDANS" not in location_name and 
+                       ("HOUSE" in location_name and "LITTLEROOT" in location_name)))
+    
     # Check milestones OR infer from game state
+    # SET_CLOCK is complete if we've left our house OR have Pokemon OR visited rival
+    has_set_clock = 'SET_CLOCK' in completed or has_pokemon or 'RIVAL_BEDROOM' in completed
+    # If at player house 2F or beyond, clock is set (you can't reach 2F without going through cutscene)
+    if at_player_house_2f:
+        has_set_clock = True
+    
     # CRITICAL: If you have Pokemon (STARTER_CHOSEN), you MUST have visited rival bedroom already!
     has_rival_bedroom = 'RIVAL_BEDROOM' in completed or has_pokemon or 'STARTER_CHOSEN' in completed
     has_route_101 = 'ROUTE_101' in completed or at_route_101 or has_pokemon
     has_starter = 'STARTER_CHOSEN' in completed or has_pokemon
     has_pokedex = 'RECEIVED_POKEDEX' in completed or has_pokedex_flag  # Check actual flag!
     
-    # Story progression logic
-    if not has_rival_bedroom and not has_pokemon:
+    # Story progression logic - START WITH SET_CLOCK (very first step)
+    # Priority 1: Player needs to set the clock in their bedroom (2F) before mom lets them leave
+    if not has_set_clock and at_player_house_1f:
         return {
-            'story': "You just moved to Littleroot Town. Your rival lives here too. You need to visit their bedroom.",
-            'goal': "RIVAL_BEDROOM",
-            'why': "Meeting your rival is required before starting your Pokemon journey"
+            'story': "You just arrived at your new home! Mom says to go upstairs to your room. Go to the stairs and up to 2F to set your clock.",
+            'goal': "SET_CLOCK",
+            'why': "Mom won't let you leave until you set the clock upstairs in your bedroom (2F)",
+            'nav_hint': "Go UP the stairs (upper-left area of 1F) to reach 2F and set your clock"
         }
+    elif not has_set_clock and at_player_house_2f:
+        return {
+            'story': "You're in your bedroom! Go to the clock on the wall and interact with it (press A) to set the time.",
+            'goal': "SET_CLOCK",
+            'why': "Setting the clock triggers the cutscene and lets you leave the house",
+            'nav_hint': "Walk to the clock on the wall and press A to interact"
+        }
+    elif not has_rival_bedroom and not has_pokemon:
+        # After setting clock, go to rival's house
+        if at_player_house_1f or at_player_house_2f:
+            return {
+                'story': "Clock is set! Now go downstairs and leave your house. Your rival lives next door - visit their bedroom.",
+                'goal': "RIVAL_BEDROOM",
+                'why': "Meeting your rival is required before starting your Pokemon journey",
+                'nav_hint': "Go downstairs (if on 2F), then exit through the bottom door. Rival's house is next door."
+            }
+        elif at_rival_house and "1F" in location_name:
+            return {
+                'story': "You're in your rival's house! Go upstairs to their bedroom (2F) to meet them.",
+                'goal': "RIVAL_BEDROOM", 
+                'why': "Your rival is waiting upstairs in their room",
+                'nav_hint': "Go UP the stairs to reach 2F and meet your rival"
+            }
+        else:
+            return {
+                'story': "You just moved to Littleroot Town. Your rival lives here too. You need to visit their bedroom.",
+                'goal': "RIVAL_BEDROOM",
+                'why': "Meeting your rival is required before starting your Pokemon journey"
+            }
     elif not has_route_101 and not has_pokemon:
         return {
             'story': "You've met your rival. Professor Birch is studying Pokemon on Route 101 north of town.",
@@ -90,10 +138,9 @@ def _get_story_context(completed, location_name, party_size, has_pokedex_flag=Fa
         }
     elif has_pokemon and not has_pokedex:
         # Have starter, but Birch might tell you to find May/Brendan first!
-        # Check if FIRST_RIVAL_BATTLE is completed
-        # NOTE: We should NOT infer from ROUTE_103 - just stepping in Route 103 doesn't mean battle is done!
-        # Check if actually received Pokedex (which means rival battle is complete)
-        rival_battled = 'FIRST_RIVAL_BATTLE' in completed or has_pokedex_flag
+        # FIX: Don't trust checkpoint FIRST_RIVAL_BATTLE - may be stale!
+        # Only trust if we have Pokedex (definitive proof rival was beaten)
+        rival_battled = has_pokedex_flag  # Remove checkpoint trust: 'FIRST_RIVAL_BATTLE' in completed
         
         if rival_battled:
             # Battled rival, now return to lab for Pokedex
@@ -110,7 +157,10 @@ def _get_story_context(completed, location_name, party_size, has_pokedex_flag=Fa
                     'why': "Birch will give you the Pokedex now that you've proven yourself"
                 }
         else:
-            # Birch wants you to find May/Brendan on Route 103 first
+            # Go to Route 103 to find and battle rival
+            # REMOVED: GRIND_ROUTE_101 logic - just proceed to rival battle!
+            # Wild Pokemon battles happen naturally during travel
+            
             if at_lab:
                 return {
                     'story': "Birch says: 'Find May/Brendan on Route 103!' Go north through Oldale Town to Route 103.",
@@ -128,6 +178,7 @@ def _get_story_context(completed, location_name, party_size, has_pokedex_flag=Fa
                     'story': "On Route 103! Look for your rival May/Brendan to battle them.",
                     'goal': "FIRST_RIVAL_BATTLE",
                     'why': "Battle your rival, then return to Birch for Pokedex"
+
                 }
             else:
                 return {
@@ -143,17 +194,84 @@ def _get_story_context(completed, location_name, party_size, has_pokedex_flag=Fa
             'why': "You've completed early game tasks. Now explore Route 101 and progress to Oldale Town"
         }
     else:
-        # Has Pokedex, not at lab - continue adventure
+        # Has Pokedex, not at lab - go WEST to Route 102 → Petalburg City!
         return {
-            'story': "Early game complete! Time to explore Hoenn region and head to Oldale Town.",
-            'goal': "OLDALE_TOWN",
-            'why': "Continue north through Route 101 to reach Oldale Town and progress your adventure"
+            'story': "Pokédex received! Continue your journey WEST through Oldale Town to Route 102 → Petalburg City.",
+            'goal': "ROUTE_102",
+            'why': "Head WEST from Oldale Town to Route 102, then continue to Petalburg City for your next adventure"
         }
 
-def _get_milestone_action(location_name, completed, game_state, is_stuck, party_size=0, has_pokedex=False):
+def _get_direction_to_target(player_x: int, player_y: int, target_x: int, target_y: int) -> str:
+    """
+    Compute the primary direction to move from player position to target.
+    Returns human-readable direction string for VLM guidance.
+    
+    Args:
+        player_x, player_y: Current player position
+        target_x, target_y: Target coordinates (stairs, door, etc.)
+    
+    Returns:
+        Direction string like 'UP', 'DOWN', 'LEFT', 'RIGHT', or combination like 'UP and LEFT'
+    """
+    dx = target_x - player_x
+    dy = target_y - player_y
+    
+    if dx == 0 and dy == 0:
+        return "you're at the target"
+    
+    directions = []
+    
+    # Priority: Y direction first (UP/DOWN), then X (LEFT/RIGHT)
+    if dy < 0:
+        directions.append("UP")
+    elif dy > 0:
+        directions.append("DOWN")
+    
+    if dx < 0:
+        directions.append("LEFT")
+    elif dx > 0:
+        directions.append("RIGHT")
+    
+    if len(directions) == 1:
+        return directions[0]
+    elif len(directions) == 2:
+        return f"{directions[0]} and {directions[1]}"
+    else:
+        return "explore to find target"
+
+def _get_stairs_direction_2f(player_x: int, player_y: int, is_player_house: bool = False) -> str:
+    """
+    Get direction to stairs on 2F of houses. Visual map shows stairs at (1,1).
+    Returns VLM-friendly direction guidance.
+    """
+    # Stairs at (1, 1) based on visual map ground truth (not portal data!)
+    stairs_x, stairs_y = 1, 1
+    direction = _get_direction_to_target(player_x, player_y, stairs_x, stairs_y)
+    
+    if direction == "you're at the target":
+        return "at stairs - press DOWN to descend to 1F"
+    else:
+        return f"go {direction} to reach stairs at ({stairs_x},{stairs_y}), then DOWN to 1F"
+
+def _get_door_direction_1f(player_x: int, player_y: int) -> str:
+    """
+    Get direction to exit door on 1F of houses. Door is typically at (1, 8).
+    Returns VLM-friendly direction guidance.
+    """
+    # Door at (1, 8) based on verified coordinates
+    door_x, door_y = 1, 8
+    direction = _get_direction_to_target(player_x, player_y, door_x, door_y)
+    
+    if direction == "you're at the target":
+        return "at door - press DOWN to exit house"
+    else:
+        return f"go {direction} to door at ({door_x},{door_y}), then DOWN to exit"
+
+def _get_milestone_action(location_name, completed, game_state, is_stuck, party_size=0, has_pokedex=False, player_x=0, player_y=0, player_gender='Boy'):
     """
     Get specific action to progress toward next milestone
     Uses both milestone flags AND game state (party_size, pokedex, location) for accuracy
+    Now position-aware: computes actual direction to stairs/doors based on player coords
     """
     if game_state == 'dialog':
         return "Press A to advance dialog (story/NPC conversation)"
@@ -173,8 +291,9 @@ def _get_milestone_action(location_name, completed, game_state, is_stuck, party_
     
     # If player has Pokemon but not at lab, check if rival battled first!
     # MUST battle rival on Route 103 BEFORE going to lab for Pokedex!
-    # NOTE: Don't infer from ROUTE_103 - just stepping there doesn't mean battle is done
-    rival_battled = 'FIRST_RIVAL_BATTLE' in completed
+    # FIX: Don't trust checkpoint FIRST_RIVAL_BATTLE - may be stale!
+    # Only trust Pokedex as proof (received AFTER rival battle at lab)
+    rival_battled = 'RECEIVED_POKEDEX' in completed  # More reliable than FIRST_RIVAL_BATTLE
     
     if has_pokemon and not at_lab and not has_pokedex and 'RECEIVED_POKEDEX' not in completed:
         if not rival_battled:
@@ -198,31 +317,70 @@ def _get_milestone_action(location_name, completed, game_state, is_stuck, party_
             else:
                 return "Return to Professor Birch's Lab in Littleroot Town to receive Pokedex"
     
-    # If player has Pokemon AND Pokedex, guide to next area
+    # If player has Pokemon AND Pokedex, guide to Route 102 → Petalburg (next area)
     if has_pokemon and (has_pokedex or 'RECEIVED_POKEDEX' in completed):
         if location_name == "LITTLEROOT_TOWN":
-            return "Go UP/NORTH to Route 101, then continue north to Oldale Town"
+            return "Go UP/NORTH to Route 101 → Oldale Town → Then WEST to Route 102 → Petalburg City"
         elif at_lab:
-            return "Exit lab (DOWN), then go NORTH through town to Route 101 → Oldale Town"
+            return "Exit lab (DOWN), go NORTH to Oldale Town, then WEST to Route 102 → Petalburg City"
         elif at_route_101:
-            return "Continue UP/NORTH through Route 101 to reach Oldale Town"
+            return "Continue NORTH to Oldale Town, then go WEST to Route 102 → Petalburg City"
+        elif "OLDALE" in location_name.upper():
+            return "Go WEST/LEFT to Route 102 → Continue west to Petalburg City"
+        elif "ROUTE 102" in location_name.upper():
+            return "Continue WEST through Route 102 to reach Petalburg City"
         else:
-            return "Head north to Oldale Town (Route 101 → Oldale)"
+            return "Head WEST to Route 102 → Petalburg City (the next milestone)"
     
     # Original early-game logic (no Pokemon yet)
     if not has_pokemon:
         if 'RIVAL_BEDROOM' not in completed:
             if location_name == "LITTLEROOT_TOWN":
-                return "Enter the house on the RIGHT/EAST (rival's house) to reach bedroom upstairs"
-            elif location_name in ("MAYS_HOUSE_1F", "BRENDANS_HOUSE_1F"):
-                return "Go UP-RIGHT to find stairs, then press UP to go upstairs to bedroom"
-            elif location_name in ("MAYS_HOUSE_2F", "BRENDANS_HOUSE_2F"):
-                return "Walk around bedroom to trigger milestone completion"
+                # Note: For Brendan, rival (May) is RIGHT. For May, rival (Brendan) is LEFT.
+                # Just enter the OTHER house (not yours) to trigger story event.
+                return "Enter your RIVAL's house (the OTHER house in town, not yours) and go upstairs to bedroom"
+            elif "BRENDAN" in location_name.upper():
+                # GENDER-AWARE LOGIC:
+                # - Girl player: BRENDANS_HOUSE = RIVAL's house → go upstairs!
+                # - Boy player: BRENDANS_HOUSE = PLAYER's house → EXIT!
+                if player_gender == 'Girl':
+                    # Girl: Brendan's = RIVAL's house - this is correct!
+                    if "2F" in location_name.upper():
+                        return "✅ You're in RIVAL's (Brendan's) bedroom! Walk around to trigger milestone completion"
+                    else:
+                        return "Go UPSTAIRS to find rival's (Brendan's) bedroom (up the stairs)"
+                else:
+                    # Boy: Brendan's = PLAYER's house - wrong, exit!
+                    if "2F" in location_name.upper():
+                        stairs_dir = _get_stairs_direction_2f(player_x, player_y)
+                        return f"⚠️ This is YOUR bedroom! EXIT: {stairs_dir}, exit house, then go to MAY's house (rival's house) in town"
+                    else:
+                        door_dir = _get_door_direction_1f(player_x, player_y)
+                        return f"⚠️ This is YOUR house! EXIT: {door_dir}, then go to MAY's house (rival's house) in town"
+            elif "MAY" in location_name.upper():
+                # GENDER-AWARE LOGIC:
+                # - Girl player: MAYS_HOUSE = PLAYER's house → EXIT!
+                # - Boy player: MAYS_HOUSE = RIVAL's house → go upstairs!
+                if player_gender == 'Girl':
+                    # Girl: May's = PLAYER's house - wrong, exit!
+                    if "2F" in location_name.upper():
+                        stairs_dir = _get_stairs_direction_2f(player_x, player_y)
+                        return f"⚠️ This is YOUR bedroom! EXIT: {stairs_dir}, exit house, then go to BRENDAN's house (rival's house) in town"
+                    else:
+                        door_dir = _get_door_direction_1f(player_x, player_y)
+                        return f"⚠️ This is YOUR house! EXIT: {door_dir}, then go to BRENDAN's house (rival's house) in town"
+                else:
+                    # Boy: May's = RIVAL's house - this is correct!
+                    if "2F" in location_name.upper():
+                        return "✅ You're in RIVAL's (May's) bedroom! Walk around to trigger milestone completion"
+                    else:
+                        return "Go UPSTAIRS to find rival's (May's) bedroom (up the stairs)"
             elif at_lab:
-                return "Exit lab (DOWN), then go to rival's house (right building in town)"
+                return "Exit lab (DOWN), then go to your rival's house (the OTHER house in town)"
             else:
                 return "Navigate to rival's house to complete RIVAL_BEDROOM milestone"
         
+
         elif 'ROUTE_101' not in completed:
             if location_name == "LITTLEROOT_TOWN":
                 return "Go UP/NORTH to exit town and reach Route 101 (where Birch is)"
@@ -521,8 +679,20 @@ class ServerAPIOracle:
         else:
             self.lab_visit_count = 0
         
-        story_ctx = _get_story_context(completed, location_name, party_size, has_pokedex)
-        action_guide = _get_milestone_action(location_name, completed, game_state, is_stuck, party_size, has_pokedex)
+        # Get lead Pokemon level for grind mode check
+        lead_level = 5  # Default
+        progress_ctx = memory.get('progress_context', {})
+        party_data = progress_ctx.get('party', [])
+        if party_data and len(party_data) > 0 and party_data[0]:
+            lead_level = party_data[0].get('level', 5)
+        
+        story_ctx = _get_story_context(completed, location_name, party_size, has_pokedex, lead_level)
+        # DEBUG: Log lead_level and goal to diagnose GRIND issue
+        if self.step_count % 50 == 0:
+            logger.info(f"📊 STORY_CTX DEBUG: lead_level={lead_level}, goal={story_ctx.get('goal', 'UNKNOWN')}, party_size={party_size}")
+        # Get player gender for position-aware guidance
+        player_gender = memory.get('player', {}).get('gender', 'Boy')
+        action_guide = _get_milestone_action(location_name, completed, game_state, is_stuck, party_size, has_pokedex, x, y, player_gender)
         
         # Extract quest memory context (replaces hard-coded reminders!)
         npc_context = ""
@@ -656,16 +826,18 @@ Party: {memory.get('party_size', 0)} Pokemon | Badges: {memory.get('badge_count'
 **➡️ TO PROGRESS STORY:**
 {action_guide}
 
-**🚨 CRITICAL RULES - YOU HAVE A STARTER POKEMON:**
-⚠️ RIVAL (May) IS ONLY ON ROUTE 103! NEVER IN ANY HOUSE!
+**🚨 CRITICAL RULES - MILESTONE AWARE:**
+{"" if 'RIVAL_BEDROOM' not in completed else '''⚠️ RIVAL (May) IS ONLY ON ROUTE 103! NEVER IN ANY HOUSE!
 ⛔ You CANNOT find rival at any house!
 ⛔ You CANNOT battle rival at any house!
-⛔ Do NOT go to rival's house!
-⛔ Do NOT go upstairs in any house!
-✅ Brendan's house = YOUR house (Mom heals here)
+✅ RIVAL_BEDROOM done - EXIT any house!
 ✅ If in ANY house: ACTION = DOWN (exit immediately!)
-✅ If in 2F/bedroom: ACTION = DOWN (go to stairs!)
-✅ Birch = PROFESSOR at lab, NOT your rival!
+✅ Birch = PROFESSOR at lab, NOT your rival!'''}{"" if 'RIVAL_BEDROOM' in completed else f'''🎯 RIVAL_BEDROOM NOT DONE - GO TO RIVAL'S HOUSE!
+✅ For {player_gender}: {"BRENDAN's house is RIVAL's" if player_gender == 'Girl' else "MAY's house is RIVAL's"}
+✅ Go to rival's house and upstairs to bedroom!
+✅ If in YOUR house (wrong): EXIT with DOWN, then go to rival's!
+✅ If in RIVAL's house 1F: Go UPSTAIRS to bedroom!
+✅ If in RIVAL's 2F/bedroom: Walk around to trigger milestone!'''}
 
 **RESPOND (tie your action to story/milestone):**
 LOCATION: {location_name} - [visual description]
@@ -839,8 +1011,9 @@ REASON: [how this advances the story toward {story_ctx['goal']}]
         # CRITICAL: After STARTER_CHOSEN, rival (May) is on ROUTE 103, NOT in bedroom!
         starter_chosen = 'STARTER_CHOSEN' in completed
         has_pokedex = 'RECEIVED_POKEDEX' in completed
-        # NOTE: Don't infer from ROUTE_103 - just stepping there doesn't mean battle is done
-        rival_battled = 'FIRST_RIVAL_BATTLE' in completed
+        # FIX: Don't trust checkpoint FIRST_RIVAL_BATTLE - may be stale from previous run!
+        # Only trust Pokedex (received at lab AFTER rival battle)
+        rival_battled = has_pokedex
         
         # =====================================================
         # CRITICAL RULE: After getting starter Pokemon:
@@ -910,10 +1083,10 @@ REASON: [how this advances the story toward {story_ctx['goal']}]
             # In Route 101 AFTER starter - continue north to Oldale
             return f"📍 LOCATION: Route 101 at ({x},{y})\n🎯 QUEST: Reach Oldale Town then Route 103\n🌿 TERRAIN: Walk through grass (it's walkable!)\nACTION: UP (move north through grass)\nREASON: Continue north to Oldale Town. Don't avoid grass - walk through it!"
         
-        elif map_id == 0x0102 and starter_chosen and not rival_battled:
+        elif map_id == 0x11 and starter_chosen and not rival_battled:  # Fixed: Oldale Town is 0x11, not 0x0102
             # In Oldale Town - Visit PokeCenter FIRST to set respawn point!
             if not hasattr(self, 'visited_oldale_pokecenter') or not self.visited_oldale_pokecenter:
-                return f"📍 LOCATION: Oldale Town at ({x},{y})\n🏥 IMPORTANT: Visit PokeCenter at (7,13) to set respawn!\n⚠️ Without this, blackouts send you to Littleroot!\nACTION: Go to PokeCenter (center of town)\nREASON: Visiting PokeCenter saves your respawn point here!"
+                return f"📍 LOCATION: Oldale Town at ({x},{y})\n🏥 IMPORTANT: Visit PokeCenter at (6,17) to set respawn!\n⚠️ Without this, blackouts send you to Littleroot!\nACTION: Go LEFT to PokeCenter entrance\nREASON: Visiting PokeCenter saves your respawn point here!"
             else:
                 return f"📍 LOCATION: Oldale Town at ({x},{y})\n✅ Respawn set at PokeCenter!\n🎯 QUEST: May is waiting on Route 103 (north exit)\n🗺️ DIRECTION: Exit NORTH to Route 103\nACTION: UP (move to north exit)\nREASON: May (rival) is on Route 103. Battle her!"
         
@@ -925,7 +1098,7 @@ REASON: [how this advances the story toward {story_ctx['goal']}]
             # In Birch Lab after rival battle - get Pokedex!
             return f"📍 LOCATION: Birch's Lab at ({x},{y})\n🎯 QUEST: Receive Pokedex from Professor Birch\n✅ READY: Battled rival, can now get Pokedex\nACTION: Move toward Birch, press A\nREASON: After battling rival, Birch gives you the Pokedex"
         
-        elif (map_id == 0x0102 or map_id == 0x0012) and rival_battled and not has_pokedex:
+        elif (map_id == 0x11 or map_id == 0x0012) and rival_battled and not has_pokedex:  # Fixed: Oldale Town is 0x11
             # Battled rival, need to return to Lab
             return f"📍 LOCATION: {location} at ({x},{y})\n✅ RIVAL BATTLE COMPLETE!\n🎯 QUEST: Return to Birch's Lab for Pokedex\n🗺️ PATH: Go south to Littleroot Town\nACTION: DOWN (move south)\nREASON: Birch is waiting at his lab to give you the Pokedex"
         
@@ -1081,17 +1254,50 @@ def main():
             self.terrain_nav = TerrainNavigator()
             self.current_map_id = None
         
-        def get_exit_for_objective(self, connections: list, objective: str) -> tuple:
+        def get_exit_for_objective(self, connections: list, objective: str, map_id: int = None) -> tuple:
             """
             Find the best exit coordinates from dynamic server connections.
             
             Args:
                 connections: List of {'to': location, 'from_pos': [x,y], 'to_pos': [x,y]}
                 objective: What we're trying to reach ('route103', 'pokecenter', 'oldale', etc)
+                map_id: Current map ID for location-specific overrides
             
             Returns:
                 (x, y) tuple of exit coordinates, or None if not found
             """
+            # --- PORTAL CONNECTION OVERRIDES ---
+            # For specific maps where server connection data is incorrect
+            if map_id == 0x202:  # Oldale Mart
+                if objective.upper() == 'OLDALE':
+                    # Server data gives entry point (14,7), but actual door is at (3,7)/(4,7)
+                    return (3, 7)
+            
+            # Birch's Lab - exit is at (6, 12) (door at bottom center)
+            if map_id in [0x020C, 0x104]:  # BIRCH_LAB map IDs
+                if objective.upper() in ['LITTLEROOT', 'ROUTE101', 'EXIT']:
+                    return (6, 12)
+            
+            # May's House 1F (0x102) - exit door at (1, 8), server wrongly says (14,9)
+            if map_id == 0x102:
+                if objective.upper() in ['LITTLEROOT', 'EXIT', 'TOWN']:
+                    return (1, 8)  # Actual door position from user verification
+            
+            # May's House 2F (0x103) - stairs to 1F at (2, 2)
+            if map_id == 0x103:
+                if objective.upper() in ['1F', 'DOWNSTAIRS', 'EXIT', 'STAIRS']:
+                    return (2, 2)  # Stairs to 1F
+            
+            # Brendan's House 1F (0x100) - exit door (gender-aware, same layout)
+            if map_id == 0x100:
+                if objective.upper() in ['LITTLEROOT', 'EXIT', 'TOWN']:
+                    return (1, 8)  # Same layout as May's house
+            
+            # Brendan's House 2F (0x101) - stairs to 1F
+            if map_id == 0x101:
+                if objective.upper() in ['1F', 'DOWNSTAIRS', 'EXIT', 'STAIRS']:
+                    return (2, 2)  # Stairs to 1F
+            
             if not connections:
                 return None
             
@@ -1126,6 +1332,146 @@ def main():
                         return (int(from_pos[0]), int(from_pos[1]))
             
             return None
+        
+        # ═══════════════════════════════════════════════════════════════════════════
+        # NAVIGATION COORDINATE STRATEGY
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 
+        # When determining navigation coordinates, use different sources based on context:
+        #
+        # 1. INDOOR → EXIT (House, Lab, PokeCenter, Mart, etc.)
+        #    ✅ USE: Visual map DD labels (real-time ground truth)
+        #    ❌ AVOID: Portal connections (often have wrong coordinates)
+        #    Reason: Portal data for interior exits is frequently incorrect.
+        #            The visual map's DD (door) markers show exact tile positions.
+        #
+        # 2. OUTDOOR → ENTER BUILDING (Littleroot → Houses, Lab, etc.)
+        #    ✅ USE: Visual map D labels OR Portal connections  
+        #    Both are usually accurate for building entrances from outside.
+        #    Portal connections work well here because they track actual warp tiles.
+        #
+        # 3. OUTDOOR → ANOTHER ROUTE/CITY (Route 101 → Oldale, etc.)
+        #    ✅ USE: Portal connections
+        #    ❌ AVOID: Visual map labels (routes are too large for label parsing)
+        #    Reason: Route transitions are map-boundary warps, portals are accurate.
+        #
+        # Implementation:
+        #   - For indoor maps: Call parse_visual_map_for_door() to find DD labels
+        #   - For outdoor building entry: Use portal connections (they're accurate)
+        #   - For route transitions: Use portal connections (they're accurate)
+        #   - Fallback: Hardcoded overrides in get_exit_for_objective() for broken portals
+        #
+        # ═══════════════════════════════════════════════════════════════════════════
+        
+        def parse_visual_map_for_door(self, visual_map: str, door_type: str = 'DD') -> Optional[Tuple[int, int]]:
+            """
+            Parse the visual map string to find DD (double door) or D (door) label coordinates.
+            
+            The visual map from the server has format like:
+                "  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15"
+                "0  # # # # # # # # # # # # # # # #"
+                "1  # . . . . . . D D . . . . . . #"
+                ...
+            
+            Args:
+                visual_map: The visual_map string from /state endpoint
+                door_type: 'DD' for double door (exits), 'D' for single door, 'S' for stairs
+            
+            Returns:
+                (x, y) tuple of the door/stairs position, or None if not found
+                
+            Usage:
+                - Indoor exits: Use 'DD' to find the exit door
+                - Stairs: Use 'S' to find stair tiles
+                - Building entries (outdoor): Use 'D' labels
+            """
+            if not visual_map:
+                return None
+            
+            try:
+                lines = visual_map.split('\n')
+                
+                # Find the door marker
+                for line_idx, line in enumerate(lines):
+                    # Skip header/metadata lines
+                    if 'MAP:' in line or 'Player' in line or 'Movement' in line or 'Portal' in line:
+                        continue
+                    
+                    # Look for DD (double door) or D (single door) markers
+                    if door_type == 'DD':
+                        # DD is two D characters next to each other
+                        dd_pos = line.find('D D')  # With spaces between grid cells
+                        if dd_pos == -1:
+                            dd_pos = line.find('DD')  # Without spaces
+                        
+                        if dd_pos != -1:
+                            # Parse the line to find grid position
+                            # Lines have format like: "12  # . D D . #" where 12 is y-coord
+                            parts = line.strip().split()
+                            if len(parts) > 0 and parts[0].isdigit():
+                                y_coord = int(parts[0])
+                                # Find x position by counting cells
+                                cell_content = ' '.join(parts[1:])
+                                cells = parts[1:]
+                                for x, cell in enumerate(cells):
+                                    if cell == 'D':
+                                        # Check if next cell is also D (DD pattern)
+                                        if x + 1 < len(cells) and cells[x + 1] == 'D':
+                                            # Return the first D of DD (left door tile)
+                                            return (x, y_coord)
+                                        # If looking for single D, return first D found
+                                        if door_type == 'D':
+                                            return (x, y_coord)
+                    
+                    elif door_type == 'D':
+                        # Single D marker
+                        parts = line.strip().split()
+                        if len(parts) > 0 and parts[0].isdigit():
+                            y_coord = int(parts[0])
+                            cells = parts[1:]
+                            for x, cell in enumerate(cells):
+                                if cell == 'D':
+                                    return (x, y_coord)
+                    
+                    elif door_type == 'S':
+                        # Stairs marker
+                        parts = line.strip().split()
+                        if len(parts) > 0 and parts[0].isdigit():
+                            y_coord = int(parts[0])
+                            cells = parts[1:]
+                            for x, cell in enumerate(cells):
+                                if cell == 'S':
+                                    return (x, y_coord)
+            
+            except Exception as e:
+                logger.warning(f"Error parsing visual map for {door_type}: {e}")
+            
+            return None
+        
+        def get_indoor_exit_from_visual_map(self, memory: dict) -> Optional[Tuple[int, int]]:
+            """
+            Get indoor exit coordinates from visual map DD labels.
+            
+            This is the preferred method for finding exits from indoor locations
+            because portal connection data is often incorrect for interior exits.
+            
+            Args:
+                memory: The memory dict from server /state endpoint
+                
+            Returns:
+                (x, y) tuple of exit door position, or None if not found
+            """
+            visual_map = memory.get('map', {}).get('visual_map', '')
+            if not visual_map:
+                return None
+            
+            # Try DD first (double door = main exit)
+            exit_pos = self.parse_visual_map_for_door(visual_map, 'DD')
+            if exit_pos:
+                return exit_pos
+            
+            # Fallback to single D
+            return self.parse_visual_map_for_door(visual_map, 'D')
         
         def _preprocess_frame(self, frame_b64: str) -> np.ndarray:
             try:
@@ -1163,6 +1509,970 @@ def main():
         def step(self, action: int):
             self.step_count += 1
             action_name = self.button_map[action]
+            skip_stuck_override = False  # Flag to skip stuck detection when high-priority override active
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🚨 STUCK ACTION OVERRIDE - Force terrain action when stuck 50+ steps
+            # Fetches position from server directly for fresh data
+            # ═══════════════════════════════════════════════════════════════════
+            try:
+                # Get fresh position from server
+                import requests
+                state_resp = requests.get("http://localhost:8000/state", timeout=1).json()
+                player = state_resp.get('player', {})
+                position = player.get('position', {})
+                current_x = position.get('x')
+                current_y = position.get('y')
+                
+                if current_x is not None and current_y is not None:
+                    current_pos = (current_x, current_y)
+                    
+                    if not hasattr(self, '_override_last_pos'):
+                        self._override_last_pos = current_pos
+                        self._override_stuck_count = 0
+                    
+                    if current_pos == self._override_last_pos:
+                        self._override_stuck_count += 1
+                    else:
+                        self._override_stuck_count = 0
+                        self._override_last_pos = current_pos
+                    
+                    # Debug: Log counter value every 10 steps
+                    if self.step_count % 10 == 0:
+                        logger.info(f"🔧 OVERRIDE DEBUG: count={self._override_stuck_count} pos={current_pos}")
+                    
+                    # Check if we're in persistent forced mode (keep forcing for 30 steps to complete waypoint path)
+                    if getattr(self, '_forced_steps_remaining', 0) > 0:
+                        # GET FRESH DIRECTION for CURRENT position
+                        forced_action = None
+                        map_id = state_resp.get('map', {}).get('id', 0)
+                        metatile_info = getattr(self, 'cached_metatile', None)
+                        
+                        # Use terrain_nav for direction on ANY map (not just Oldale!)
+                        if hasattr(self, 'terrain_nav') and metatile_info:
+                            # Get goal based on context - use cached target or default cycling
+                            goal = getattr(self, '_persist_goal', None)
+                            if goal:
+                                nav_result = self.terrain_nav.get_direction(
+                                    map_id=map_id, x=current_x, y=current_y,
+                                    goal=goal, metatile_info=metatile_info
+                                )
+                                if nav_result and nav_result.get('action') in ['LEFT', 'RIGHT', 'UP', 'DOWN']:
+                                    forced_action = nav_result['action']
+                        
+                        if not forced_action:
+                            # Fallback: CYCLE through directions (not same action!)
+                            directions = ['LEFT', 'DOWN', 'RIGHT', 'UP']
+                            cycle_step = 30 - self._forced_steps_remaining  # 0 to 29
+                            cycle_index = (cycle_step // 5) % 4  # Change direction every 5 steps
+                            forced_action = directions[cycle_index]
+                        
+                        action_name = forced_action
+                        direction_to_action = {'UP': 2, 'DOWN': 3, 'LEFT': 4, 'RIGHT': 5}
+                        action = direction_to_action.get(forced_action, action)
+                        skip_stuck_override = True
+                        self._forced_stuck_action = forced_action
+                        self._forced_stuck_action_int = action
+                        self._forced_steps_remaining -= 1
+                        
+                        # When persistent ends, set cooldown to prevent immediate re-trigger
+                        if self._forced_steps_remaining == 0:
+                            self._persist_cooldown = 30  # Don't re-trigger for 30 steps
+                        
+                        if self.step_count % 5 == 0:
+                            logger.warning(f"🔄 PERSISTENT NAV: {forced_action} at ({current_x},{current_y}) ({self._forced_steps_remaining} steps remaining)")
+                    else:
+                        # Decrement cooldown if active
+                        if getattr(self, '_persist_cooldown', 0) > 0:
+                            self._persist_cooldown -= 1
+                        
+                        # Only trigger new STUCK override if: stuck >= 100 AND no cooldown active (SAFETY NET ONLY!)
+                        if self._override_stuck_count >= 100 and getattr(self, '_persist_cooldown', 0) == 0:
+                            # CYCLE through directions - no spamming same action!
+                            directions = ['LEFT', 'DOWN', 'RIGHT', 'UP']
+                            cycle_index = ((self._override_stuck_count - 100) // 5) % 4
+                            forced_action = directions[cycle_index]
+                            action_name = forced_action  # Override the action name!
+                            # CRITICAL: Also override the action INTEGER for emulator!
+                            # button_map = [A, B, UP, DOWN, LEFT, RIGHT, NOOP]
+                            direction_to_action = {'UP': 2, 'DOWN': 3, 'LEFT': 4, 'RIGHT': 5}
+                            action = direction_to_action.get(forced_action, action)
+                            skip_stuck_override = True  # Prevent other overrides from overwriting!
+                            self._forced_stuck_action = forced_action  # Save for final override!
+                            self._forced_stuck_action_int = action  # Save action integer too!
+                            # Start persistent forcing for 30 steps to complete waypoint path
+                            self._forced_steps_remaining = 30
+                            self._persistent_forced_action = forced_action
+                            if self._override_stuck_count % 5 == 0:
+                                logger.warning(f"🚨 STUCK OVERRIDE: {self._override_stuck_count} steps at ({current_x},{current_y}) → FORCING {forced_action} [PERSIST 30, cycling]")
+            except Exception as e:
+                if self.step_count % 50 == 0:
+                    logger.warning(f"🚨 STUCK OVERRIDE ERROR: {e}")
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🏥 FORCED NURSE JOY (from previous step) - HIGHEST PRIORITY!
+            # Late-stage sets force_nurse_next_action, we apply it here at step start
+            # ═══════════════════════════════════════════════════════════════════
+            if getattr(self, 'force_nurse_next_action', None):
+                action_name = self.force_nurse_next_action
+                skip_stuck_override = True  # Don't let stuck detection override this!
+                coords = getattr(self, 'force_nurse_coords', ('?', '?'))
+                logger.warning(f"💊 FORCED NURSE (from prev step): {action_name} at {coords}")
+                
+                # If this is an A press at (7,4) AND we've done enough presses (10+), healing is complete
+                # Only set visited=True after 10+ A presses to complete the full healing dialog
+                dialog_count = getattr(self, 'nurse_dialog_counter', 0)
+                if action_name == 'A' and coords == (7, 4) and dialog_count >= 10:
+                    if not getattr(self, 'visited_oldale_pokecenter', False):
+                        self.visited_oldale_pokecenter = True
+                        self.oldale_pokecenter_visited = True
+                        logger.warning(f"✅ NURSE JOY HEALED! Respawn point set. HP restored! (after {dialog_count} A presses)")
+                        # Reset dialog counter for next healing visit
+                        self.nurse_dialog_counter = 0
+                        # Sync milestone to server
+                        try:
+                            requests.post("http://localhost:8000/milestone", 
+                                json={"name": "OLDALE_POKECENTER_HEALED", "completed": True}, 
+                                timeout=1)
+                        except Exception:
+                            pass
+                elif action_name == 'A' and coords == (7, 4):
+                    # Still in healing dialog, log progress
+                    if dialog_count % 3 == 0:
+                        logger.info(f"💊 Nurse Joy dialog: {dialog_count}/10 A presses...")
+                
+                self.force_nurse_next_action = None  # Clear for next step
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # ⚔️ BATTLE ACTION OVERRIDE - Enhanced with PP tracking and fallbacks
+            # Pokemon Emerald battle menu: FIGHT (top-left) is default selected
+            # Pressing A selects FIGHT, then selects first move. Fast & efficient!
+            # If stuck in battle (PP exhausted or moves fail), try switch/run fallback.
+            # ═══════════════════════════════════════════════════════════════════
+            in_battle_now = False
+            try:
+                # First check cached state (fast)
+                game_state = getattr(self, 'cached_game_state', '').upper()
+                if game_state == 'BATTLE':
+                    in_battle_now = True
+                else:
+                    # Fallback: fetch LIVE from server (more accurate but slower)
+                    # Only check when position seems stuck (potential battle transition)
+                    if not hasattr(self, '_last_battle_check') or self.step_count - self._last_battle_check > 10:
+                        self._last_battle_check = self.step_count
+                        try:
+                            state_resp = requests.get("http://localhost:8000/state", timeout=0.5)
+                            if state_resp.ok:
+                                state_data = state_resp.json()
+                                live_state = state_data.get('game', {}).get('game_state', '').upper()
+                                if live_state == 'BATTLE':
+                                    in_battle_now = True
+                                    self.cached_game_state = 'BATTLE'  # Update cache
+                                    logger.info("⚔️ BATTLE DETECTED (live API check)")
+                                else:
+                                    # Battle ended - reset tracking
+                                    if hasattr(self, '_battle_start_step'):
+                                        logger.info(f"⚔️ BATTLE ENDED after {self.step_count - self._battle_start_step} steps")
+                                        delattr(self, '_battle_start_step')
+                                    if hasattr(self, '_battle_fallback_count'):
+                                        delattr(self, '_battle_fallback_count')
+                                    self.cached_game_state = live_state
+                        except:
+                            pass
+                
+                if in_battle_now:
+                    # Track battle duration for stuck detection
+                    if not hasattr(self, '_battle_start_step'):
+                        self._battle_start_step = self.step_count
+                        self._battle_fallback_count = 0
+                        logger.info(f"⚔️ BATTLE STARTED at step {self.step_count}")
+                    
+                    battle_duration = self.step_count - self._battle_start_step
+                    
+                    # Check if stuck in battle for too long (100+ steps = ~10 seconds)
+                    # If so, try fallback: switch Pokemon (DOWN then RIGHT to get to PKMN menu)
+                    if battle_duration > 100 and battle_duration % 50 == 0:
+                        self._battle_fallback_count = getattr(self, '_battle_fallback_count', 0) + 1
+                        fallback_phase = self._battle_fallback_count % 4
+                        
+                        if fallback_phase == 1:
+                            # Try to access Pokemon menu (DOWN from FIGHT)
+                            action_name = 'DOWN'
+                            logger.warning(f"⚔️ BATTLE STUCK ({battle_duration} steps): Trying fallback DOWN (to PKMN menu)")
+                        elif fallback_phase == 2:
+                            # Select Pokemon menu
+                            action_name = 'A'
+                            logger.warning(f"⚔️ BATTLE STUCK: Selecting Pokemon menu")
+                        elif fallback_phase == 3:
+                            # Try to switch to next Pokemon (DOWN then A)
+                            action_name = 'DOWN'
+                            logger.warning(f"⚔️ BATTLE STUCK: Trying to switch Pokemon")
+                        else:
+                            # Confirm switch
+                            action_name = 'A'
+                            logger.warning(f"⚔️ BATTLE STUCK: Confirming switch/action")
+                        
+                        skip_stuck_override = True
+                    elif action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                        # Normal battle - force A to attack
+                        original_action = action_name
+                        action_name = 'A'
+                        skip_stuck_override = True  # Battle is handled
+                        if self.step_count % 10 == 0:
+                            logger.info(f"⚔️ BATTLE OVERRIDE: {original_action} → A (attack, duration: {battle_duration} steps)")
+            except Exception as e:
+                if self.step_count % 100 == 0:
+                    logger.debug(f"Battle detection error: {e}")
+            
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🏥 POKECENTER ENTRANCE OVERRIDE - DISABLED!
+            # Now using TERRAIN A* with VISUAL MAP ground truth for navigation.
+            # The visual map with . (walkable) and # (blocked) provides real-time
+            # terrain data that A* can use for proper pathfinding around obstacles.
+            # Portal connections provide door locations as navigation goals.
+            # ═══════════════════════════════════════════════════════════════════
+            # (Previously had hardcoded dx/dy navigation that caused stuck loops)
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🏥 POKECENTER INTERIOR: Force UP to Nurse Joy until healed!
+            # When inside PokeCenter and haven't set respawn, force UP then A
+            # ═══════════════════════════════════════════════════════════════════
+            if hasattr(self, 'current_x') and hasattr(self, 'current_y') and hasattr(self, 'current_location'):
+                location_upper = str(self.current_location).upper()
+                if ('POKECENTER' in location_upper or 'POKEMON CENTER' in location_upper) and '2F' not in location_upper:
+                    # Run interior navigation if EITHER:
+                    # 1. Never visited (visited=False) - need to set respawn
+                    # 2. Already visited BUT HP is low (need to heal again)
+                    hp_needs_heal = getattr(self, 'cached_hp_ratio', 0.0) < 0.5
+                    needs_nurse = not getattr(self, 'visited_oldale_pokecenter', False) or hp_needs_heal
+                    
+                    if needs_nurse:
+                        # Inside PokeCenter and needs to talk to Nurse Joy!
+                        # NURSE JOY requires agent at (7, 4) - counter is at (7, 3)
+                        skip_stuck_override = True  # Don't let stuck detection mess with this!
+                        
+                        nurse_x, nurse_y = 7, 4  # Target position to talk to Nurse Joy (who is at 7,3)
+                        npc_x, npc_y = 4, 4  # NPC blocking the corridor
+                        
+                        # Check if at EXACT Nurse Joy interaction position (7, 4)
+                        if self.current_x == 7 and self.current_y == 4:
+                            # At exact counter position - press A multiple times for dialog!
+                            # Nurse Joy dialog requires: talk, confirm, wait for animation, dismiss
+                            # Need ~10 A presses to fully complete healing
+                            if not hasattr(self, 'nurse_dialog_counter'):
+                                self.nurse_dialog_counter = 0
+                            self.nurse_dialog_counter += 1
+                            
+                            action_name = 'A'
+                            if self.step_count % 5 == 0:
+                                logger.warning(f"💊 NURSE JOY: At counter, pressing A ({self.nurse_dialog_counter}/10)")
+                            
+                            # After 10+ A presses, healing should be complete
+                            # Set flag for force_nurse to apply on NEXT step
+                            if self.nurse_dialog_counter >= 10:
+                                self.force_nurse_next_action = 'A'
+                                self.force_nurse_coords = (self.current_x, self.current_y)
+                        elif self.current_x == 6 and self.current_y == 4:
+                            # One step away from counter - go RIGHT to reach (7,4)
+                            action_name = 'RIGHT'
+                            if self.step_count % 10 == 0:
+                                logger.info(f"💊 NURSE JOY: At (6,4), going RIGHT to reach counter at (7,4)")
+                        else:
+                            # ═══════════════════════════════════════════════════════════════
+                            # NPC AVOIDANCE: There's an NPC at (4, 4) blocking the corridor
+                            # If we're at y=4 and x<4, we MUST go DOWN to y=5+ first!
+                            # Path around NPC: go DOWN to y=5, RIGHT past x=4, then UP to y=4
+                            # ═══════════════════════════════════════════════════════════════
+                            
+                            if self.current_y == npc_y and self.current_x < npc_x:
+                                # On same row as NPC and to the left - go DOWN to avoid!
+                                action_name = 'DOWN'
+                                if self.step_count % 10 == 0:
+                                    logger.warning(f"💊 NPC AVOIDANCE: At ({self.current_x},{self.current_y}), NPC blocks at ({npc_x},{npc_y}). Going DOWN!")
+                                self.nurse_last_action = action_name
+                            elif self.current_y == npc_y + 1 and self.current_x < npc_x:
+                                # At y=5, below NPC corridor - go RIGHT to get past NPC
+                                action_name = 'RIGHT'
+                                if self.step_count % 10 == 0:
+                                    logger.info(f"💊 NPC BYPASS: At ({self.current_x},{self.current_y}), going RIGHT to pass NPC")
+                                self.nurse_last_action = action_name
+                            elif self.current_y > npc_y and self.current_x >= npc_x + 1:
+                                # Past NPC on x-axis, now go UP to reach y=4
+                                action_name = 'UP'
+                                if self.step_count % 10 == 0:
+                                    logger.info(f"💊 NPC PASSED: At ({self.current_x},{self.current_y}), going UP to nurse's row")
+                                self.nurse_last_action = action_name
+                            else:
+                                # USE TERRAIN A* to find passable path to Nurse Joy!
+                                nav_action = None
+                                
+                                # Initialize position-keyed blocking tracker
+                                # Key: (x, y) -> set of blocked directions at that position
+                                if not hasattr(self, 'nurse_blocked_by_pos'):
+                                    self.nurse_blocked_by_pos = {}  # {(x,y): {'RIGHT', 'UP', ...}}
+                                    self.nurse_last_action = None
+                                    self.nurse_last_pos = None
+                                
+                                current_pos = (self.current_x, self.current_y)
+                                
+                                # Initialize blocked set for this position if needed
+                                if current_pos not in self.nurse_blocked_by_pos:
+                                    self.nurse_blocked_by_pos[current_pos] = set()
+                                
+                                # Check if last action actually moved us
+                                if self.nurse_last_pos is not None and self.nurse_last_action:
+                                    if self.nurse_last_pos == current_pos:
+                                        # Position didn't change - that direction is BLOCKED at last_pos
+                                        self.nurse_blocked_by_pos[self.nurse_last_pos].add(self.nurse_last_action)
+                                        if self.step_count % 5 == 0:
+                                            logger.warning(f"💊 BLOCKED BY NPC: {self.nurse_last_action} blocked at {self.nurse_last_pos}. Memory: {dict(self.nurse_blocked_by_pos)}")
+                                
+                                self.nurse_last_pos = current_pos
+                                
+                                # Get blocked directions for CURRENT position
+                                blocked_at_current = self.nurse_blocked_by_pos.get(current_pos, set())
+                                
+                                # Try A* first (if we haven't blocked that direction)
+                                if hasattr(self, 'terrain_nav') and hasattr(self, 'cached_metatile'):
+                                    map_id = getattr(self, 'current_map_id', 0x0200)
+                                    metatile = getattr(self, 'cached_metatile', [])
+                                    if metatile and len(metatile) >= 15:
+                                        nav_result = self.terrain_nav.get_direction(
+                                            map_id, self.current_x, self.current_y, 
+                                            (nurse_x, nurse_y), metatile
+                                        )
+                                        if nav_result and isinstance(nav_result, dict):
+                                            nav_action = nav_result.get('action')
+                                
+                                # If A* direction was already blocked, find alternative
+                                if nav_action in blocked_at_current:
+                                    nav_action = None
+                                
+                                if nav_action and nav_action in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                                    action_name = nav_action
+                                    if self.step_count % 10 == 0:
+                                        logger.info(f"💊 NURSE JOY A*: ({self.current_x},{self.current_y}) -> {nav_action} to ({nurse_x},{nurse_y})")
+                                else:
+                                    # A* failed or blocked - try any unblocked direction
+                                    all_dirs = ['DOWN', 'RIGHT', 'UP', 'LEFT']
+                                    available_dirs = [d for d in all_dirs if d not in blocked_at_current]
+                                    
+                                    if available_dirs:
+                                        # Pick direction that moves toward nurse
+                                        best_dir = None
+                                        for d in available_dirs:
+                                            dx = {'LEFT': -1, 'RIGHT': 1, 'UP': 0, 'DOWN': 0}
+                                            dy = {'LEFT': 0, 'RIGHT': 0, 'UP': -1, 'DOWN': 1}
+                                            new_x = self.current_x + dx[d]
+                                            new_y = self.current_y + dy[d]
+                                            # Prefer directions that get us closer to nurse
+                                            dist_now = abs(self.current_x - nurse_x) + abs(self.current_y - nurse_y)
+                                            dist_new = abs(new_x - nurse_x) + abs(new_y - nurse_y)
+                                            if dist_new < dist_now:
+                                                best_dir = d
+                                                break
+                                        
+                                        action_name = best_dir if best_dir else available_dirs[0]
+                                        if self.step_count % 10 == 0:
+                                            logger.warning(f"💊 NURSE ALT DIR: ({self.current_x},{self.current_y}) -> {action_name} (blocked: {blocked_at_current})")
+                                    else:
+                                        # All 4 directions blocked at this position! Clear and try again
+                                        self.nurse_blocked_by_pos[current_pos] = set()
+                                        action_name = 'DOWN'  # Try DOWN to escape
+                                        if self.step_count % 10 == 0:
+                                            logger.error(f"💊 ALL 4 DIRS BLOCKED! Resetting at ({self.current_x},{self.current_y})")
+                                
+                                self.nurse_last_action = action_name
+                    else:
+                        # ═══════════════════════════════════════════════════════════════
+                        # visited=True - BUT check HP first! If HP low, need to heal again!
+                        # Only exit if HP is healthy (>= 50%)
+                        # ═══════════════════════════════════════════════════════════════
+                        hp_needs_heal = getattr(self, 'cached_hp_ratio', 0.0) < 0.5  # Default 0.0 = assume low HP
+                        
+                        if hp_needs_heal:
+                            # HP is low - need to heal! Go UP to Nurse Joy just like first visit
+                            skip_stuck_override = True
+                            if self.current_y > 4:
+                                action_name = 'UP'
+                                if self.step_count % 10 == 0:
+                                    logger.info(f"💉 PC HEAL NEEDED (HP<50%): At ({self.current_x},{self.current_y}), going UP to Nurse Joy")
+                            else:
+                                # At counter area - press A to heal
+                                action_name = 'A'
+                                if self.step_count % 10 == 0:
+                                    logger.info(f"💉 PC HEAL NEEDED: At counter ({self.current_x},{self.current_y}), pressing A to heal")
+                        else:
+                            # HP is healthy - EXIT THE POKECENTER!
+                            # Agent may be stuck in dialog - alternate A to dismiss, DOWN to move
+                            # Exit warp is at (7, 8) - go DOWN until y=8, then position will warp
+                            skip_stuck_override = True  # We're handling this ourselves
+                            
+                            # Track dialog dismissal attempts
+                            if not hasattr(self, 'pc_exit_counter'):
+                                self.pc_exit_counter = 0
+                            self.pc_exit_counter += 1
+                        
+                            # If stuck at y<=4 (counter area), likely in dialog - press A to dismiss
+                            if self.current_y <= 4:
+                                if self.pc_exit_counter % 3 == 0:
+                                    # Every 3rd step, press A to dismiss any dialog
+                                    action_name = 'A'
+                                    if self.step_count % 10 == 0:
+                                        logger.info(f"🏥 PC EXIT: At ({self.current_x},{self.current_y}), pressing A to dismiss dialog")
+                                else:
+                                    # Otherwise try DOWN toward exit
+                                    action_name = 'DOWN'
+                                    if self.step_count % 10 == 0:
+                                        logger.info(f"🏥 PC EXIT: At ({self.current_x},{self.current_y}), going DOWN toward exit (y=8)")
+                            elif self.current_y < 8:
+                                # Between counter and exit - just go DOWN
+                                action_name = 'DOWN'
+                                if self.step_count % 15 == 0:
+                                    logger.info(f"🏥 PC EXIT: At ({self.current_x},{self.current_y}), going DOWN to exit")
+                            elif self.current_y >= 8:
+                                # At exit row - might need to be at x=7 for warp
+                                if self.current_x < 7:
+                                    action_name = 'RIGHT'
+                                elif self.current_x > 7:
+                                    action_name = 'LEFT'
+                                else:
+                                    # At (7,8) - warp should trigger, press DOWN to exit
+                                    action_name = 'DOWN'
+                                if self.step_count % 10 == 0:
+                                    logger.info(f"🏥 PC EXIT: At exit row ({self.current_x},{self.current_y}), action={action_name}")
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🔄 UNIVERSAL STUCK DETECTION - Track position and force alternatives
+            # When coordinates don't change for 3+ steps, cycle through directions
+            # This prevents getting stuck in corners or against walls
+            # MORE AGGRESSIVE: Even when PokeCenter override is active!
+            # ═══════════════════════════════════════════════════════════════════
+            stuck_penalty = 0.0  # Penalty for being stuck
+            if hasattr(self, 'current_x') and hasattr(self, 'current_y'):
+                current_pos = (self.current_x, self.current_y)
+                
+                # Initialize tracking if not exists
+                if not hasattr(self, 'stuck_position_history'):
+                    self.stuck_position_history = []
+                    self.stuck_direction_cycle = 0
+                    self.last_stuck_pos = None
+                    self.stuck_persistence_counter = 0
+                
+                # Add current position to history
+                self.stuck_position_history.append(current_pos)
+                if len(self.stuck_position_history) > 10:
+                    self.stuck_position_history.pop(0)
+                
+                # Check if stuck (same position for last 3 steps - MORE AGGRESSIVE)
+                if len(self.stuck_position_history) >= 3:
+                    recent_3 = self.stuck_position_history[-3:]
+                    all_same = all(pos == recent_3[0] for pos in recent_3)
+                    
+                    # Count total steps stuck
+                    if all_same:
+                        self.stuck_persistence_counter += 1
+                        
+                        # PENALTY for being stuck - scales with how long stuck
+                        # This provides reward signal for learning, NOT action override
+                        stuck_penalty = -10.0 * min(self.stuck_persistence_counter, 10)  # Max -100
+                        
+                        # Log stuck status (but DO NOT override action - let policy learn!)
+                        if self.stuck_persistence_counter % 20 == 0:
+                            logger.info(f"🔄 STUCK PENALTY: {stuck_penalty} (position {current_pos}, {self.stuck_persistence_counter} steps)")
+                        
+                        # Clear terrain cache periodically to force A* recompute
+                        if hasattr(self, 'terrain_nav') and self.stuck_persistence_counter % 10 == 0:
+                            self.terrain_nav.clear_cache()
+                        
+                        # 🆕 GLOBAL ACTION DIVERSITY (30+ steps stuck at same position)
+                        # Uses reward-based learning to teach PPO to try different actions
+                        if self.stuck_persistence_counter >= 30:
+                            # Get last action to compare
+                            if not hasattr(self, 'global_last_stuck_action'):
+                                self.global_last_stuck_action = None
+                                self.global_action_counter = {}
+                            
+                            # Track action usage
+                            self.global_action_counter[action_name] = self.global_action_counter.get(action_name, 0) + 1
+                            most_used = max(self.global_action_counter, key=self.global_action_counter.get)
+                            
+                            if action_name == most_used and self.global_action_counter[most_used] > 10:
+                                # HEAVY penalty for repeating same action when stuck 30+ steps
+                                diversity_penalty = -150.0
+                                stuck_penalty += diversity_penalty
+                                if self.stuck_persistence_counter % 30 == 0:
+                                    logger.warning(f"🛑 STUCK DIVERSITY: {action_name} × {self.global_action_counter[most_used]} → -150 (try different!)")
+                            elif action_name != most_used:
+                                # BONUS for trying different action
+                                diversity_bonus = 100.0
+                                stuck_penalty += diversity_bonus
+                                if self.stuck_persistence_counter % 10 == 0:
+                                    logger.info(f"✅ DIVERSITY BONUS: {action_name} (not {most_used}) → +100")
+                            
+                            self.global_last_stuck_action = action_name
+                        
+                        # 🆕 FORCED ACTION OVERRIDE (100+ steps stuck)
+                        # PPO learning too slow - directly override policy action with terrain guidance
+                        if self.stuck_persistence_counter >= 100 and hasattr(self, 'terrain_nav'):
+                            try:
+                                memory = getattr(self, 'cached_memory', {})
+                                current_x = memory.get('x', 0)
+                                current_y = memory.get('y', 0)
+                                # Get terrain-recommended action
+                                terrain_result = self.terrain_nav.get_next_action(current_x, current_y, memory)
+                                if terrain_result and terrain_result.get('action'):
+                                    forced_action = terrain_result['action']
+                                    action_map = {'UP': 5, 'DOWN': 6, 'LEFT': 7, 'RIGHT': 8, 'A': 0, 'B': 1}
+                                    if forced_action in action_map:
+                                        # FORCE the terrain action
+                                        action = action_map[forced_action]
+                                        if self.stuck_persistence_counter % 50 == 0:
+                                            logger.warning(f"🚨 FORCED ACTION OVERRIDE: Stuck {self.stuck_persistence_counter} steps → FORCING {forced_action}")
+                            except Exception as e:
+                                pass  # Fall through to normal policy
+                    else:
+                        # Moving again - reset
+                        self.stuck_direction_cycle = 0
+                        self.stuck_persistence_counter = 0
+                        # Clear action counter when unstuck
+                        if hasattr(self, 'global_action_counter'):
+                            self.global_action_counter = {}
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🧭 TERRAIN NAV ACTION FORCING - Use ground truth A* instead of RL policy!
+            # After healing done, force agent to follow terrain navigation to Route 103
+            # This ensures agent uses real-time ground truth instead of untrained policy
+            # SKIP if HP is low (< 50%) - agent needs to enter PokeCenter to heal!
+            # ═══════════════════════════════════════════════════════════════════
+            already_healed = getattr(self, 'visited_oldale_pokecenter', False)
+            current_location = str(getattr(self, 'current_location', '')).upper()
+            last_terrain = getattr(self, 'last_terrain_result', None)
+            
+            # Check HP - if low, don't force terrain (allow healing behavior)
+            hp_low = False
+            try:
+                if hasattr(self, 'cached_hp_ratio') and self.cached_hp_ratio < 0.5:
+                    hp_low = True
+            except:
+                pass
+            
+            # Only apply in Oldale Town EXTERIOR or ROUTE 103/101 (not inside buildings)
+            in_oldale_town = 'OLDALE' in current_location and 'POKECENTER' not in current_location and 'MART' not in current_location and 'HOUSE' not in current_location
+            on_route_103 = 'ROUTE' in current_location and '103' in current_location
+            on_route_101 = 'ROUTE' in current_location and '101' in current_location
+            
+            # Also skip if near PokeCenter entrance (6,17) - let healing logic handle
+            near_pokecenter = hasattr(self, 'current_x') and hasattr(self, 'current_y') and abs(self.current_x - 6) <= 1 and abs(self.current_y - 17) <= 1
+            
+            # Apply terrain override for all outdoor navigation areas
+            should_apply_terrain = (already_healed and in_oldale_town) or on_route_103 or on_route_101
+            
+            # REWARD-BASED TERRAIN GUIDANCE (not action override!)
+            # The compute_reward() function uses last_terrain to give:
+            #   +200 for following A* direction
+            #   -50 for going opposite direction
+            # This allows the policy to LEARN from terrain rewards instead of being forced
+            if should_apply_terrain and last_terrain and not hp_low and not near_pokecenter:
+                terrain_dir = last_terrain.get('action')
+                if terrain_dir and terrain_dir in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                    # Log terrain guidance (but DO NOT override action!)
+                    if self.step_count % 50 == 0:
+                        logger.info(f"🧭 TERRAIN REWARD GUIDANCE: Recommended {terrain_dir} (A* path, policy chooses)")
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🚨 FORCED ACTION OVERRIDE FOR POKECENTER 2F ESCAPE
+            # When stuck on 2F, force toward escalator at (1, 6) based on position!
+            # This bypasses the RL policy to physically force escalator exit.
+            # ═══════════════════════════════════════════════════════════════════
+            # ⚠️ DISABLED: 2F override for PPO learning
+            enable_2f_override = False
+            if enable_2f_override and hasattr(self, 'steps_on_2f') and hasattr(self, 'current_location') and hasattr(self, 'current_x') and hasattr(self, 'current_y'):
+                if self.steps_on_2f > 30 and '2F' in str(self.current_location).upper():
+                    original_action = action_name
+                    escalator_x, escalator_y = 1, 6  # Escalator exit position
+                    
+                    # POSITION-AWARE OVERRIDE:
+                    # - Force LEFT only if x > escalator_x (agent to the right of escalator)
+                    # - Force RIGHT only if x < escalator_x (agent to the left of escalator, went past it)
+                    # - Force UP if y > escalator_y (agent below escalator)
+                    # - Force DOWN if y < escalator_y (agent above escalator)
+                    
+                    if self.current_x > escalator_x:
+                        # Agent to the RIGHT of escalator - force LEFT
+                        if action_name == 'RIGHT':
+                            action_name = 'LEFT'
+                            if self.step_count % 100 == 0:
+                                logger.warning(f"🚨 2F OVERRIDE: Forced RIGHT → LEFT (x={self.current_x}→{escalator_x})")
+                    elif self.current_x < escalator_x:
+                        # Agent to the LEFT of escalator (went past it) - force RIGHT
+                        if action_name == 'LEFT':
+                            action_name = 'RIGHT'
+                            if self.step_count % 100 == 0:
+                                logger.warning(f"🚨 2F OVERRIDE: Forced LEFT → RIGHT (x={self.current_x}→{escalator_x})")
+                    
+                    # Only override UP/DOWN based on relative position to escalator
+                    if self.current_y > escalator_y:
+                        # Agent BELOW escalator (y > 6) - need to go UP
+                        if action_name == 'DOWN':
+                            action_name = 'UP'  # Force UP toward escalator
+                            if self.step_count % 100 == 0:
+                                logger.warning(f"🚨 2F OVERRIDE: Forced DOWN → UP (y={self.current_y}→{escalator_y})")
+                    elif self.current_y < escalator_y:
+                        # Agent ABOVE escalator (y < 6) - need to go DOWN
+                        if action_name == 'UP':
+                            action_name = 'DOWN'  # Force DOWN toward escalator
+                            if self.step_count % 100 == 0:
+                                logger.warning(f"🚨 2F OVERRIDE: Forced UP → DOWN (y={self.current_y}→{escalator_y})")
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🏠 EARLY GAME HOUSE A* OVERRIDE - Forces navigation to 2F stairs
+            # When in player's house 1F (before SET_CLOCK) or rival's house 1F
+            # (before RIVAL_BEDROOM), override terrain A* to target the stairs.
+            # This ensures proper early game progression: 2F → set clock → leave
+            # ═══════════════════════════════════════════════════════════════════
+            current_location = str(getattr(self, 'current_location', '')).upper()
+            current_x = getattr(self, 'current_x', None)
+            current_y = getattr(self, 'current_y', None)
+            
+            # Check if we're in early game house navigation situation
+            at_player_house_1f = ("MAYS HOUSE 1F" in current_location or "BRENDANS HOUSE 1F" in current_location or
+                                  "MAY HOUSE 1F" in current_location or "BRENDAN HOUSE 1F" in current_location)
+            at_player_house_2f = ("MAYS HOUSE 2F" in current_location or "BRENDANS HOUSE 2F" in current_location or
+                                  "MAY HOUSE 2F" in current_location or "BRENDAN HOUSE 2F" in current_location or
+                                  "PLAYER BEDROOM" in current_location)
+            at_rival_house_1f = ("RIVAL" in current_location and "1F" in current_location)
+            
+            # Also detect rival house by exclusion: in a Littleroot house but not player's house
+            if "LITTLEROOT" in current_location and "HOUSE" in current_location and "1F" in current_location:
+                if not at_player_house_1f:
+                    at_rival_house_1f = True
+            
+            has_pokemon = getattr(self, 'has_pokemon', False) or getattr(self, 'party_size', 0) > 0
+            
+            # Milestone tracking - check actual flags or infer from location
+            # SET_CLOCK: True if we have Pokemon OR we've been on 2F (cutscene triggers when reaching 2F)
+            has_set_clock = has_pokemon or at_player_house_2f or getattr(self, 'visited_player_2f', False)
+            # Track if we've been to 2F
+            if at_player_house_2f:
+                self.visited_player_2f = True
+                has_set_clock = True
+            
+            # RIVAL_BEDROOM: True if we have Pokemon OR we've visited rival's room
+            has_rival_bedroom = has_pokemon or getattr(self, 'visited_rival_bedroom', False)
+            # Track if at rival's 2F
+            if "RIVAL" in current_location and "2F" in current_location:
+                self.visited_rival_bedroom = True
+                has_rival_bedroom = True
+            
+            # ROUTE_101: True if we have Pokemon (we've been to Route 101 to get starter)
+            has_route_101 = has_pokemon
+            
+            # Typical stairs coordinates in Pokemon Emerald houses:
+            # Player house: stairs at roughly (8, 2) or (2, 2) - upper left/right area
+            # Rival house: similar layout
+            # We'll use A* once we set the goal - A* will find the path
+            
+            early_game_override = False
+            early_game_target = None
+            stairs_goal = None
+            
+            if at_player_house_1f and not has_set_clock:
+                # Force navigation to stairs in player house 1F (going UP to set clock)
+                # Stairs are typically in upper-left area of 1F (around x=2, y=1)
+                stairs_goal = (2, 1)  # Upper left corner where stairs are
+                early_game_override = True
+                early_game_target = "stairs_up"
+                if self.step_count % 100 == 0:
+                    logger.info(f"🏠 HOUSE OVERRIDE: Player house 1F - navigating to stairs at {stairs_goal}")
+            elif at_player_house_1f and has_set_clock and not has_rival_bedroom:
+                # Clock is set, need to EXIT house to go to rival's house
+                # Exit door is typically at bottom center of 1F (around x=4-5, y=8-9)
+                stairs_goal = (4, 8)  # Bottom door exit
+                early_game_override = True
+                early_game_target = "exit_door"
+                if self.step_count % 100 == 0:
+                    logger.info(f"🏠 HOUSE OVERRIDE: Player house 1F - clock set, navigating to exit at {stairs_goal}")
+            elif at_player_house_2f and has_set_clock and not has_rival_bedroom:
+                # Clock is set, on 2F, need to go DOWN stairs first
+                # Stairs down are in same location as stairs up
+                stairs_goal = (8, 1)  # Stairs location on 2F (usually right side)
+                early_game_override = True
+                early_game_target = "stairs_down"
+                if self.step_count % 100 == 0:
+                    logger.info(f"🏠 HOUSE OVERRIDE: Player house 2F - clock set, navigating to stairs DOWN at {stairs_goal}")
+            elif at_rival_house_1f and not has_rival_bedroom:
+                # Force navigation to stairs in rival house 1F (going UP to bedroom)
+                # Same layout as player house
+                stairs_goal = (2, 1)
+                early_game_override = True
+                early_game_target = "stairs_up"
+                if self.step_count % 100 == 0:
+                    logger.info(f"🏠 HOUSE OVERRIDE: Rival house 1F - navigating to stairs at {stairs_goal}")
+            elif at_rival_house_1f and has_rival_bedroom and not has_route_101:
+                # Visited rival bedroom, need to EXIT house to go to Route 101
+                stairs_goal = (4, 8)  # Bottom door exit
+                early_game_override = True
+                early_game_target = "exit_door"
+                if self.step_count % 100 == 0:
+                    logger.info(f"🏠 HOUSE OVERRIDE: Rival house 1F - visited rival, navigating to exit at {stairs_goal}")
+            elif "RIVAL" in current_location and "2F" in current_location and has_rival_bedroom:
+                # Visited rival on 2F, need to go DOWN stairs
+                stairs_goal = (8, 1)
+                early_game_override = True
+                early_game_target = "stairs_down"
+                if self.step_count % 100 == 0:
+                    logger.info(f"🏠 HOUSE OVERRIDE: Rival house 2F - visited rival, navigating to stairs DOWN at {stairs_goal}")
+            
+            # If early game override is active, compute A* direction to target
+            if early_game_override and stairs_goal and current_x is not None and current_y is not None:
+                sx, sy = stairs_goal
+                dx = sx - current_x
+                dy = sy - current_y
+                
+                # Simple directional priority: go toward target
+                # Prioritize Y first (get to correct row), then X
+                override_dir = None
+                if abs(dy) > abs(dx):  # Prioritize vertical movement
+                    if dy < 0:
+                        override_dir = 'UP'
+                    elif dy > 0:
+                        override_dir = 'DOWN'
+                else:  # Horizontal movement
+                    if dx < 0:
+                        override_dir = 'LEFT'
+                    elif dx > 0:
+                        override_dir = 'RIGHT'
+                
+                # If at target location, try pressing A to interact (stairs/door)
+                if abs(dx) <= 1 and abs(dy) <= 1:
+                    override_dir = 'A'  # Interact with stairs or door
+                    target_name = early_game_target if 'early_game_target' in dir() else 'target'
+                    if self.step_count % 50 == 0:
+                        logger.info(f"🏠 HOUSE OVERRIDE: At {target_name} ({current_x},{current_y}) - pressing A")
+                
+                # Apply the override if we have a direction
+                if override_dir and action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                    if action_name != override_dir:
+                        original_action = action_name
+                        action_name = override_dir
+                        skip_stuck_override = True  # Prevent terrain A* from fighting
+                        if self.step_count % 50 == 0:
+                            logger.warning(f"🏠 HOUSE OVERRIDE: {original_action} → {override_dir} (toward {stairs_goal})")
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🧭 UNIVERSAL TERRAIN A* OVERRIDE
+            # Force policy to follow terrain A* when it chooses opposite direction.
+            # This prevents the agent from going backwards when A* has a clear path.
+            # Only overrides OPPOSITE direction - does not block A/B or perpendicular moves.
+            # SKIP if house override already applied (early_game_override = True)
+            # ═══════════════════════════════════════════════════════════════════
+            terrain_result = getattr(self, 'last_terrain_result', None)
+            if terrain_result and not early_game_override:  # Skip if house override active
+                terrain_dir = terrain_result.get('action')
+                if terrain_dir in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                    opposite = {'UP': 'DOWN', 'DOWN': 'UP', 'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}
+                    # Force action toward terrain direction ONLY if policy chose opposite
+                    if action_name == opposite.get(terrain_dir):
+                        original_action = action_name
+                        action_name = terrain_dir  # Follow terrain!
+                        location_str = str(getattr(self, 'current_location', '')).upper()
+                        if self.step_count % 50 == 0:
+                            logger.warning(f"🚨 TERRAIN OVERRIDE: {original_action} → {terrain_dir} (A* path) @ {location_str}")
+            
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🩺 UNIVERSAL HEALING INTERRUPT - FORCES ACTIONS WHEN HP CRITICAL
+            # Has HIGHEST priority - overrides ALL other navigation!
+            # Triggers on: 1) HP critical (<30%) OR 2) Active HEAL directive
+            # Uses cached healing_target from step() SLAM pathfinding  
+            # ═══════════════════════════════════════════════════════════════════
+            healing_target = getattr(self, 'cached_healing_target', None)
+            healing_interrupt = getattr(self, 'cached_healing_interrupt', False)
+            cached_directive = str(getattr(self, 'cached_directive_target', '') or '').upper()
+            current_location = str(getattr(self, 'current_location', '')).upper()
+            current_x = getattr(self, 'current_x', None)
+            current_y = getattr(self, 'current_y', None)
+            
+            # Trigger on HP critical OR active HEAL directive
+            # BUT skip if already visited PokeCenter (healing done!)
+            already_healed = getattr(self, 'visited_oldale_pokecenter', False)
+            has_heal_directive = ('HEAL' in cached_directive or 'POKECENTER' in cached_directive) and not already_healed
+            should_force_healing = ((healing_interrupt and healing_target) or has_heal_directive) and not already_healed
+            
+            if should_force_healing and action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT', 'A']:
+                heal_type = healing_target.get('type', '') if healing_target else ''
+                heal_action = healing_target.get('action', '') if healing_target else ''
+                heal_coords = healing_target.get('coords') if healing_target else None
+                target_dir = None
+                
+                # Determine the direction to force based on healing target
+                if heal_type == 'NURSE_JOY' or 'POKECENTER' in current_location:
+                    # In PokeCenter - go to nurse and press A
+                    if current_y is not None and current_y <= 4:
+                        target_dir = 'A'  # At nurse counter
+                    else:
+                        target_dir = 'UP'  # Walk to nurse
+                        
+                elif heal_type == 'MOM':
+                    # In player's house 1F - find and talk to Mom
+                    target_dir = 'A' if action_name != 'A' else None  # Try talking
+                    
+                elif heal_type == 'GO_DOWNSTAIRS':
+                    # In bedroom - go to stairs (need to go UP into them like house exit)
+                    target_dir = 'UP'
+                    
+                elif heal_type in ['OLDALE_PC', 'PLAYER_HOUSE']:
+                    # Heading to a destination - use coordinate pathfinding
+                    if heal_coords and current_x is not None and current_y is not None:
+                        tx, ty = heal_coords
+                        dx = tx - current_x
+                        dy = ty - current_y
+                        # Prioritize larger difference
+                        if abs(dx) > abs(dy):
+                            target_dir = 'RIGHT' if dx > 0 else 'LEFT'
+                        elif dy != 0:
+                            target_dir = 'DOWN' if dy > 0 else 'UP'
+                        else:
+                            target_dir = 'A'  # At destination
+                    elif heal_action in ['GO_NORTH', 'UP']:
+                        target_dir = 'UP'
+                    elif heal_action in ['GO_SOUTH', 'DOWN']:
+                        target_dir = 'DOWN'
+                        
+                elif heal_type == 'GO_SOUTH':
+                    target_dir = 'DOWN'
+                    
+                elif heal_type == 'FIND_HEALING':
+                    # Generic - head south (toward Littleroot/Mom or Oldale)
+                    target_dir = 'DOWN' if 'ROUTE 103' in current_location else 'UP'
+                
+                # FALLBACK: If no specific target, use location-based routing
+                elif has_heal_directive and not target_dir:
+                    if 'ROUTE 101' in current_location:
+                        # Route 101 - go NORTH to Oldale PokeCenter
+                        target_dir = 'UP'
+                    elif 'ROUTE 103' in current_location:
+                        # Route 103 - go SOUTH to Oldale
+                        target_dir = 'DOWN'
+                    elif 'OLDALE' in current_location and 'POKECENTER' not in current_location:
+                        # In Oldale town - find and enter PokeCenter
+                        # PokeCenter entrance at (6, 17) - SERVER GROUND TRUTH
+                        if current_x is not None and current_y is not None:
+                            pc_x, pc_y = 6, 17
+                            dx = pc_x - current_x
+                            dy = pc_y - current_y
+                            if abs(dx) > abs(dy):
+                                target_dir = 'RIGHT' if dx > 0 else 'LEFT'
+                            elif dy != 0:
+                                target_dir = 'DOWN' if dy > 0 else 'UP'
+                            else:
+                                target_dir = 'UP'  # At PokeCenter door - walk UP to enter!
+                    elif 'LITTLEROOT' in current_location:
+                        # In Littleroot - go to player's house at (5, 4)
+                        if current_x is not None and current_y is not None:
+                            house_x, house_y = 5, 4
+                            dx = house_x - current_x
+                            dy = house_y - current_y
+                            if abs(dx) > abs(dy):
+                                target_dir = 'RIGHT' if dx > 0 else 'LEFT'
+                            elif dy != 0:
+                                target_dir = 'DOWN' if dy > 0 else 'UP'
+                            else:
+                                target_dir = 'A'  # At house door
+                
+                # REWARD-BASED HEALING GUIDANCE (not action override!)
+                # The terrain A* rewards will guide the agent to the healing location
+                # We just log the recommended direction, don't force it
+                if target_dir and target_dir in ['UP', 'DOWN', 'LEFT', 'RIGHT', 'A']:
+                    # Store for reward shaping in compute_reward()
+                    self._heal_target_dir = target_dir
+                    if self.step_count % 30 == 0:
+                        logger.info(f"🩺 HEAL REWARD GUIDANCE: Recommend {target_dir} (target={heal_type or 'DIRECTIVE'}, loc={current_location[:20]})")
+
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🚨 FORCED ACTION OVERRIDE FOR HOUSE EXITS
+            # When stuck in ANY house for >30 steps, force toward exit
+            # Simplified: in houses, exit is typically DOWN (toward door)
+            # On 2F: when AT stairs (8,2), force A to interact with stairs!
+            # ═══════════════════════════════════════════════════════════════════
+            if hasattr(self, 'steps_in_house') and hasattr(self, 'current_location'):
+                location_str = str(self.current_location).upper()
+                is_in_house = any(kw in location_str for kw in ['HOUSE', '1F', '2F', 'BEDROOM'])
+                
+                if is_in_house and self.steps_in_house > 30:
+                    # Use current_x/current_y directly (set after each step)
+                    x = getattr(self, 'current_x', None)
+                    y = getattr(self, 'current_y', None)
+                    
+                    # DEBUG: Log if we're in override mode
+                    if self.step_count % 20 == 0:
+                        logger.warning(f"🏠 HOUSE OVERRIDE CHECK: steps={self.steps_in_house}, x={x}, y={y}")
+                    
+                    target_dir = None
+                    
+                    # Only proceed if we have valid position data
+                    if x is not None and y is not None:
+                        # Compute exit direction using current frame's data
+                        if '2F' in location_str or 'BEDROOM' in location_str:
+                            exit_goal = (7, 1)  # Stairs to 1F at (7,1) - walk UP into them!
+                            # Pokemon stairs: walk UP into the stair tile at (7,1)
+                            # No A button needed - just walk into them
+                            if x == 7 and y > 1:
+                                # Need to walk UP to reach/enter stairs
+                                target_dir = 'UP'
+                                logger.warning(f"🪜 GO TO STAIRS (7,{y}): Forcing UP toward stairs at (7,1)!")
+                            elif x != 7:
+                                # Wrong column - go toward x=7
+                                target_dir = 'LEFT' if x > 7 else 'RIGHT'
+                                logger.warning(f"🪜 WRONG COLUMN ({x},{y}): Forcing {target_dir} toward x=7!")
+                        else:
+                            # 1F: Door exit at (8,8) or (9,8) - walk DOWN into it
+                            exit_goal = (8, 8)  # Door position
+                            if x >= 8 and x <= 9:
+                                # Correct column - walk DOWN into door
+                                target_dir = 'DOWN'
+                                logger.warning(f"🚪 1F AT DOOR ({x},{y}): Forcing DOWN to exit!")
+                            elif x > 9:
+                                # Too far right - go LEFT toward door
+                                target_dir = 'LEFT'
+                                logger.warning(f"🚪 1F WRONG COLUMN ({x},{y}): Forcing LEFT toward x=8/9!")
+                            elif x < 8:
+                                # Too far left - go RIGHT toward door
+                                target_dir = 'RIGHT'
+                                logger.warning(f"🚪 1F WRONG COLUMN ({x},{y}): Forcing RIGHT toward x=8/9!")
+                    
+                    # Fallback for directional actions
+                    if target_dir is None or target_dir not in ['UP', 'DOWN', 'LEFT', 'RIGHT', 'A']:
+                        # On 2F: default UP toward stairs at (8,2); on 1F: default DOWN toward exit
+                        if '2F' in location_str or 'BEDROOM' in location_str:
+                            target_dir = 'UP'
+                        else:
+                            target_dir = 'DOWN'
+                    
+                    # ⚠️ DISABLED: Force ANY wrong movement toward exit direction
+                    # Using PPO reward shaping instead of action overrides
+                    enable_house_override = False
+                    if enable_house_override and target_dir == 'A' and action_name != 'A':
+                        original_action = action_name
+                        action_name = 'A'
+                        if self.step_count % 10 == 0:
+                            logger.warning(f"🏠 HOUSE OVERRIDE: {original_action} → A (stuck {self.steps_in_house} steps, AT STAIRS)")
+                    elif enable_house_override and action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT'] and action_name != target_dir and target_dir in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                        original_action = action_name
+                        action_name = target_dir
+                        if self.step_count % 10 == 0:
+                            logger.warning(f"🏠 HOUSE OVERRIDE: {original_action} → {target_dir} (stuck {self.steps_in_house} steps)")
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 🚨 FINAL STUCK OVERRIDE - Apply forced action BEFORE sending to server!
+            # ═══════════════════════════════════════════════════════════════════
+            if getattr(self, '_forced_stuck_action', None):
+                action_name = self._forced_stuck_action
+                if self.step_count % 10 == 0:
+                    logger.warning(f"🔥 PRE-POST STUCK OVERRIDE: Forcing {action_name} (before server send)")
             
             try:
                 # Send action to server (increased timeout for stability)
@@ -1191,6 +2501,8 @@ def main():
                     position = player.get('position', {})
                     x = position.get('x', 0)
                     y = position.get('y', 0)
+                    self.current_x = x  # Store for forced action override
+                    self.current_y = y  # Store for forced action override
                     game_data = state.get('game', {})
                     
                     # WORKAROUND: Server doesn't provide map_id, infer from location string
@@ -1201,26 +2513,43 @@ def main():
                     # - Birch's Lab: 0x104
                     # - Route 101: 0x10
                     location_str = player.get('location', '').upper()
-                    location_to_map = {
-                        'MAYS HOUSE 2F': 0x103,  # RIVAL BEDROOM - check FIRST before general MAY!
-                        'MAYS HOUSE 1F': 0x102,  # Rival house 1F
-                        'BRENDANS HOUSE 2F': 0x101,  # Player bedroom
-                        'BRENDANS HOUSE 1F': 0x100,  # Player house 1F
-                        'PROFESSOR': 0x104,  # Professor Birch's Lab
-                        'BIRCH': 0x104,
-                        'LAB': 0x104,
-                        'POKECENTER': 0x200,  # PokeCenter interior - check before OLDALE!
-                        'ROUTE 103': 0x12,  # Where rival is!
-                        'ROUTE 102': 0x0F,  # West of Oldale
-                        'ROUTE 101': 0x10,  # Between Littleroot and Oldale
-                        'OLDALE': 0x11,     # Oldale Town
-                        'LITTLEROOT': 0x09,  # Check last as it might be in other location names
-                    }
-                    map_id = 0x09  # Default to town
-                    for key, mid in location_to_map.items():
-                        if key in location_str:
-                            map_id = mid
-                            break
+                    # ═══════════════════════════════════════════════════════════════════
+                    # 🗺️ GET REAL MAP_ID FROM SERVER GROUND TRUTH (NOT LOCATION STRING!)
+                    # The server provides actual map_id from memory in stitched_map_info
+                    # ═══════════════════════════════════════════════════════════════════
+                    map_id = 0x09  # Default to Littleroot
+                    
+                    # Try to get map_id from server's stitched_map_info (GROUND TRUTH)
+                    stitched_info = state.get('map', {}).get('stitched_map_info', {})
+                    current_area = stitched_info.get('current_area', {})
+                    server_map_id = current_area.get('id', '')
+                    
+                    if server_map_id:
+                        try:
+                            # Convert hex string like "0010" to int 0x10
+                            map_id = int(server_map_id, 16)
+                            if self.step_count % 100 == 0:
+                                logger.info(f"🗺️ GROUND TRUTH MAP_ID: {map_id:#06x} from server")
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Fallback to location string inference if server didn't provide map_id
+                    if not server_map_id:
+                        location_to_map = {
+                            'MAYS HOUSE 2F': 0x103,  # RIVAL BEDROOM
+                            'MAYS HOUSE 1F': 0x102,  # Rival house 1F
+                            'BRENDANS HOUSE 2F': 0x101,  # Player bedroom
+                            'BRENDANS HOUSE 1F': 0x100,  # Player house 1F
+                            'PROFESSOR': 0x104, 'BIRCH': 0x104, 'LAB': 0x104,
+                            'POKEMON CENTER': 0x200, 'POKECENTER': 0x200,
+                            'MART': 0x202,
+                            'ROUTE 103': 0x12, 'ROUTE 102': 0x0F, 'ROUTE 101': 0x10,
+                            'OLDALE': 0x11, 'LITTLEROOT': 0x09,
+                        }
+                        for key, mid in location_to_map.items():
+                            if key in location_str:
+                                map_id = mid
+                                break
                     
                     # Build memory dict for compatibility with oracle
                     game_state = game_data.get('game_state', 'overworld')
@@ -1229,6 +2558,7 @@ def main():
                     progress_ctx = game_data.get('progress_context', {})
                     party_size = progress_ctx.get('party_size', 0)
                     has_pokedex = progress_ctx.get('has_pokedex', False)
+                    self.has_pokedex_flag = has_pokedex  # Store for forced action override
                     
                     memory = {
                         'x': x,
@@ -1237,40 +2567,212 @@ def main():
                         'location': player.get('location', 'unknown'),  # Add readable location name
                         'game_state': game_state,  # Track if in dialog/battle/menu
                         'party_size': party_size,  # From progress_context
+                        'party': player.get('party', []),  # Full party data for HP checks!
                         'has_pokedex': has_pokedex,  # Track if player has Pokedex
                         'badge_count': len(game_data.get('badges', [])),
                         'money': game_data.get('money', 0),
                         'dialogue_text': game_data.get('dialogue_text', None),  # Actual NPC text for LLM parsing
                         'milestones': state.get('milestones', {}),  # Include milestones for dialogue processor
+                        'player': player,  # Include full player object for gender detection
                         # Map terrain data for dynamic pathfinding (ground truth from server)
                         'map_data': state.get('map', {}),  # Full 15x15 tile grid with behaviors
                         # Dynamic exit/portal connections from server (ground truth!)
                         'connections': state.get('map', {}).get('stitched_map_info', {}).get('current_area', {}).get('connections', []),
                     }
                     
+                    # Parse connections from location_connections (new server structure)
+                    # Format: {LocName: [[ToLoc, FromPos, ToPos], ...]}
+                    current_loc = player.get('location', '')
+                    current_loc_upper = current_loc.upper()
+                    
+                    # ═══════════════════════════════════════════════════════════════════
+                    # 🏥 LATE-STAGE POKECENTER OVERRIDE with FRESH coordinates!
+                    # ⚠️ DISABLED: Now using pure PPO reward shaping instead of action overrides
+                    # This runs AFTER coordinates are fetched from server (line 1586-1589)
+                    # PokeCenter OUTDOOR entrance is at (7, 13) - NOT the exit at (6, 17)!
+                    # ═══════════════════════════════════════════════════════════════════
+                    enable_heuristic_overrides = False  # Disabled for PPO learning
+                    if enable_heuristic_overrides and 'OLDALE' in current_loc_upper and 'POKECENTER' not in current_loc_upper and 'HOUSE' not in current_loc_upper and 'MART' not in current_loc_upper:
+                        if not getattr(self, 'visited_oldale_pokecenter', False) and not skip_stuck_override:
+                            pc_x, pc_y = 7, 13  # PokeCenter OUTDOOR entrance (door on south side)
+                            
+                            dx = pc_x - x  # -1 means need LEFT, +1 means need RIGHT
+                            dy = pc_y - y  # -1 means need UP, +1 means need DOWN
+                            
+                            # If close to entrance, force specific direction
+                            if abs(dx) <= 1 and abs(dy) <= 1:
+                                # Very close - pick exact direction
+                                if dx != 0:
+                                    action_name = 'RIGHT' if dx > 0 else 'LEFT'
+                                elif dy != 0:
+                                    action_name = 'DOWN' if dy > 0 else 'UP'
+                                else:
+                                    action_name = 'A'  # At entrance - interact
+                                skip_stuck_override = True
+                                if self.step_count % 10 == 0:
+                                    logger.warning(f"🏥 POKECENTER OVERRIDE: At ({x},{y}), target=({pc_x},{pc_y}), action={action_name}")
+                            # If on wrong row, move vertically first
+                            elif abs(dy) > 1:
+                                action_name = 'DOWN' if dy > 0 else 'UP'
+                                skip_stuck_override = True
+                            # If on wrong column, move horizontally
+                            elif abs(dx) > 1:
+                                action_name = 'RIGHT' if dx > 0 else 'LEFT'
+                                skip_stuck_override = True
+                    
+                    all_conns = state.get('location_connections', {})
+                    
+                    # Case-insensitive lookup
+                    raw_conns = []
+                    for k, v in all_conns.items():
+                        if k.upper() == current_loc_upper:
+                            raw_conns = v
+                            break
+                    
+                    parsed_conns = []
+                    for rc in raw_conns:
+                        if isinstance(rc, list) and len(rc) >= 3:
+                            parsed_conns.append({
+                                'to': rc[0],
+                                'from_pos': rc[1],
+                                'to_pos': rc[2]
+                            })
+                    memory['connections'] = parsed_conns
+
+                    
                     # Define rival_battled for local scope use (needed for navigation logic)
                     # Define rival_battled for local scope use (needed for navigation logic)
                     milestones = state.get('milestones', {})
-                    completed = milestones.get('completed', [])
+                    # Server returns milestones as dict with milestone names as KEYS, not in 'completed' field!
+                    # Check if it's the old format (has 'completed' key) or new format (milestone names are keys)
+                    if isinstance(milestones, dict) and 'completed' not in milestones:
+                        # New format: milestone names are the keys
+                        completed = list(milestones.keys())
+                    else:
+                        # Old format or fallback
+                        completed = milestones.get('completed', [])
+
                     
                     # Local override for immediate responsiveness (server lag compensation)
                     if not hasattr(self, 'completed_first_rival_battle_locally'):
                          self.completed_first_rival_battle_locally = False
                     
                     # NOTE: Don't infer from ROUTE_103 - just stepping there doesn't mean battle is done
-                    rival_battled = 'FIRST_RIVAL_BATTLE' in completed or self.completed_first_rival_battle_locally
+                    # FIXED: Don't trust checkpoint milestone - it may be from a previous game save!
+                    # Only use LOCAL detection from battle->overworld transition
+                    rival_battled = self.completed_first_rival_battle_locally  # Don't trust checkpoint milestone!
+                    
+                    # CRITICAL: Check pokedex_seen from server
+                    # NOTE: pokedex_seen is updated AFTER receiving Pokédex at Birch's Lab!
+                    # So when FIRST_RIVAL_BATTLE milestone is complete, we should go to Lab, not re-battle!
+                    try:
+                        milestones_api = requests.get(f"{self.server_url}/milestones", timeout=5).json()
+                        pokedex_seen = milestones_api.get('pokedex_seen', 0) if isinstance(milestones_api, dict) else 0
+                    except:
+                        pokedex_seen = 0  # Default to 0 if can't fetch
+                    
+                    # FIXED: When FIRST_RIVAL_BATTLE milestone is complete, DON'T override rival_battled!
+                    # The agent should go to Birch's Lab to receive Pokédex, not keep fighting rival!
+                    if rival_battled and pokedex_seen == 0:
+                        # Log only - do NOT override rival_battled!
+                        if self.step_count % 200 == 0:
+                            logger.info(f"📦 RIVAL BATTLE WON! Now go to Birch's Lab to receive Pokédex (pokedex_seen will update there)")
+                        # DO NOT set rival_battled = False - that was the bug!
                     
                     # Check for Milestone Trigger: Winning Rival Battle (Battle -> Overworld transition)
                     if not hasattr(self, 'prev_game_state'): self.prev_game_state = 'overworld'
                     if not hasattr(self, 'last_battle_was_rival'): self.last_battle_was_rival = False
                     
+                    # Early HP check for win/loss detection (before milestone trigger)
+                    party_data_early = progress_ctx.get('party', [])
+                    early_hp_ratio = 1.0
+                    if party_data_early and len(party_data_early) > 0:
+                        early_total_hp = sum(p.get('hp', 0) for p in party_data_early if p)
+                        early_total_max_hp = sum(p.get('max_hp', 1) for p in party_data_early if p) or 1
+                        early_hp_ratio = early_total_hp / early_total_max_hp
+                    
                     if self.prev_game_state == 'battle' and game_state == 'overworld':
                          if self.last_battle_was_rival and not rival_battled:
-                             logger.info("🎉 RIVAL BATTLE WON! Triggering FIRST_RIVAL_BATTLE milestone!")
-                             self.completed_first_rival_battle_locally = True
-                             rival_battled = True
+                             # Only trigger milestone if agent WON (HP > 0)
+                             if early_hp_ratio > 0:
+                                 logger.info("🎉 RIVAL BATTLE WON! Triggering FIRST_RIVAL_BATTLE milestone!")
+                                 self.completed_first_rival_battle_locally = True
+                                 rival_battled = True
+                             else:
+                                 # Agent LOST the battle - must return to Route 103 after healing
+                                 logger.warning("💀 RIVAL BATTLE LOST! Must return to Route 103 after healing.")
+                                 self.last_battle_was_rival = False  # Reset so we can try again
+                    
+                    # ═══════════════════════════════════════════════════════════════════
+                    # 🔍 RIVAL-ABSENCE CHECK - DISABLED: Causes false positives!
+                    # The FIRST_RIVAL_BATTLE milestone can come from checkpoint, not current game.
+                    # Real battle detection should use game state transition (battle->overworld)
+                    # at lines 2011-2021 above.
+                    # ═══════════════════════════════════════════════════════════════════
+                    if not hasattr(self, 'steps_on_route103_without_battle'):
+                        self.steps_on_route103_without_battle = 0
+                    
+                    # Get location directly from memory (location_upper not defined yet!)
+                    current_location = (memory.get('location', '') or '').upper()
+                    self.current_location = current_location  # Store for forced action override at step start
+                    on_route_103 = map_id == 0x12 or ('ROUTE' in current_location and '103' in current_location)
+                    has_rival_milestone = 'FIRST_RIVAL_BATTLE' in completed
+                    
+                    if on_route_103 and game_state == 'overworld':
+                        self.steps_on_route103_without_battle += 1
+                        
+                        # DISABLED - this check causes false positives when resuming from checkpoint
+                        # The milestone may exist from a different game save or previous run
+                        # Trust only the battle->overworld transition detection for setting rival_battled
+                        # if has_rival_milestone and not self.completed_first_rival_battle_locally:
+                        #     if self.steps_on_route103_without_battle >= 30:
+                        #         logger.info("🔍 RIVAL-ABSENCE: On Route 103 with FIRST_RIVAL_BATTLE milestone - battle WON! Go to Birch's Lab for Pokédex!")
+                        #         self.completed_first_rival_battle_locally = True
+                        #         rival_battled = True
+                        pass
+                    else:
+                        # Reset counter when not on Route 103
+                        self.steps_on_route103_without_battle = 0
+
                     
                     self.prev_game_state = game_state
+
+                    # ═══════════════════════════════════════════════════════════════════
+                    # 🏥 FORCED POKECENTER NURSE OVERRIDE - HIGHEST PRIORITY #
+                    # When inside PokeCenter and haven't talked to Nurse Joy yet,
+                    # FORCE UP until at counter (y<=4), then FORCE A to talk!
+                    # This runs with FRESH location data (after server response)
+                    # ═══════════════════════════════════════════════════════════════════
+                    force_nurse_action = None
+                    # DEBUG: Log current_location to see why override isn't triggering
+                    if self.step_count % 10 == 0:
+                        logger.info(f"🔍 NURSE DEBUG: current_loc='{current_location}', y={y}, visited={getattr(self, 'visited_oldale_pokecenter', False)}")
+                    if ('POKECENTER' in current_location or 'POKEMON CENTER' in current_location) and '2F' not in current_location:
+                        if not getattr(self, 'visited_oldale_pokecenter', False):
+                            # INTERNAL POKECENTER LAYOUT:
+                            # - Entry at bottom: y=16-17 (internal coords)
+                            # - Exit warp at x>=7, y=8 EXACTLY
+                            # - Nurse Joy counter at y<=4 (top)
+                            # - WARP from x=6 going UP leads to exit at (7,8)!
+                            # - y DECREASES going UP (north)
+                            # - Need to be at x<=5 to safely go UP!
+                            # USER CLARIFICATION: Agent needs to be at (7, 4) to talk to Nurse Joy at (7, 3)
+                            # TERRAIN A* will handle pathfinding - just press A when at target
+                            if x == 7 and y == 4:
+                                # At Nurse Joy interaction point (7,4) - press A to talk!
+                                force_nurse_action = 'A'
+                                logger.warning(f"💊 FORCED NURSE JOY: At counter (7,4), pressing A!")
+                            # Let terrain A* handle navigation, just set flag for next step
+                            # Do NOT override terrain A* pathfinding here
+                    
+                    # Apply forced action if set - SET FLAG FOR NEXT STEP!
+                    # Late-stage runs AFTER action sent, so we save for next step
+                    if force_nurse_action:
+                        self.force_nurse_next_action = force_nurse_action
+                        # Also set coords for logging
+                        self.force_nurse_coords = (x, y)
+
+
                     
                     # ═══════════════════════════════════════════════════════════════════
                     # ⚡ HEALING INTERRUPT LAYER - CHECKED FIRST BEFORE ALL OTHER LOGIC ⚡
@@ -1285,11 +2787,24 @@ def main():
                         hp_ratio = total_hp / total_max_hp
                     else:
                         hp_ratio = 1.0  # No party = assume full HP (early game before starter)
+                    self.cached_hp_ratio = hp_ratio  # Cache for terrain override HP check
                     
                     # SNN PRIORITY THRESHOLDS (stored for SNN input)
                     hp_warning = hp_ratio < 0.50    # 50% - start heading to heal
                     hp_critical = hp_ratio < 0.30   # 30% - interrupt all tasks!
                     hp_emergency = hp_ratio < 0.15  # 15% - maximum priority
+                    
+                    # CRITICAL: Reset visited_oldale_pokecenter if HP drops below 50%!
+                    # This handles the case where flag is True from checkpoint but HP is low
+                    # Agent needs to re-heal, so reset flag so interior navigation runs
+                    if hp_warning and getattr(self, 'visited_oldale_pokecenter', False):
+                        if not getattr(self, '_hp_reset_logged', False):
+                            logger.warning(f"🩺 HP LOW ({hp_ratio*100:.0f}%)! Resetting visited_oldale_pokecenter for re-healing")
+                            self._hp_reset_logged = True
+                        self.visited_oldale_pokecenter = False
+                        self.nurse_dialog_counter = 0  # Reset dialog counter too
+                    elif hp_ratio >= 0.50:
+                        self._hp_reset_logged = False  # Reset the log flag when HP is healthy
                     
                     # Store HP state for SNN input encoding
                     memory['hp_ratio'] = hp_ratio
@@ -1298,7 +2813,18 @@ def main():
                     memory['hp_emergency'] = hp_emergency
                     
                     # KNN: Find nearest healing location
-                    location_upper = (memory.get('location', '') or '').upper()
+                    # CACHE LAST KNOWN LOCATION (for map buffer corruption recovery)
+                    location = memory.get('location', '')
+                    if location:  # Valid location - cache it
+                        self._last_known_location = location
+                        self._last_known_map_id = map_id
+                    elif hasattr(self, '_last_known_location') and self._last_known_location:
+                        # Use cached location when current is None
+                        location = self._last_known_location
+                        if self.step_count % 100 == 0:
+                            logger.warning(f"⚠️ MAP CORRUPTION: Using cached location '{location}'")
+                    
+                    location_upper = (location or '').upper()
                     healing_interrupt_active = False
                     healing_target = None
                     
@@ -1309,12 +2835,26 @@ def main():
                         if 'POKECENTER' in location_upper:
                             # Already in PokeCenter! Go to Nurse Joy
                             healing_target = {'type': 'NURSE_JOY', 'action': 'UP_THEN_A', 'coords': (7, 3)}
-                        elif 'PLAYER' in location_upper or 'BRENDAN' in location_upper:
-                            # In player's house - find Mom
-                            if '2F' in location_upper or 'BEDROOM' in location_upper:
-                                healing_target = {'type': 'GO_DOWNSTAIRS', 'action': 'DOWN', 'coords': (1, 1)}
+                        elif 'MAY' in location_upper or 'BRENDAN' in location_upper:
+                            # GENDER-AWARE: Check if this is actually player's house
+                            # Girl: May's = player's, Brendan's = rival's
+                            # Boy: Brendan's = player's, May's = rival's
+                            player_gender_heal = memory.get('player', {}).get('gender', 'Boy')
+                            is_player_house = False
+                            if player_gender_heal == 'Girl' and 'MAY' in location_upper:
+                                is_player_house = True
+                            elif player_gender_heal != 'Girl' and 'BRENDAN' in location_upper:
+                                is_player_house = True
+                            
+                            if is_player_house:
+                                # In player's house - find Mom
+                                if '2F' in location_upper or 'BEDROOM' in location_upper:
+                                    healing_target = {'type': 'GO_DOWNSTAIRS', 'action': 'DOWN', 'coords': (1, 1)}
+                                else:
+                                    healing_target = {'type': 'MOM', 'action': 'TALK_TO_MOM', 'coords': (5, 8)}
                             else:
-                                healing_target = {'type': 'MOM', 'action': 'TALK_TO_MOM', 'coords': (5, 8)}
+                                # In rival's house - EXIT and go to player's house!
+                                healing_target = {'type': 'EXIT_RIVAL_HOUSE', 'action': 'DOWN', 'coords': None}
                         elif 'OLDALE' in location_upper:
                             # In Oldale - go to PokeCenter at (7, 13)
                             healing_target = {'type': 'OLDALE_PC', 'action': 'GO_TO_PC', 'coords': (7, 13)}
@@ -1323,13 +2863,34 @@ def main():
                             healing_target = {'type': 'GO_SOUTH', 'action': 'DOWN', 'coords': None}
                         elif 'ROUTE 101' in location_upper:
                             # Route 101 - KNN: closer to Oldale (north) or Littleroot (south)?
-                            if y < 15:  # Closer to Oldale
-                                healing_target = {'type': 'OLDALE_PC', 'action': 'UP', 'coords': None}
-                            else:  # Closer to Littleroot/Mom
-                                healing_target = {'type': 'MOM', 'action': 'DOWN', 'coords': None}
+                            # HYSTERESIS: Once healing direction is chosen, STICK WITH IT until HP restored!
+                            # This prevents oscillation at the y=15 boundary
+                            cached_heal_dir = getattr(self, '_cached_healing_direction', None)
+                            
+                            if cached_heal_dir and hp_ratio < 0.50:
+                                # Use cached direction (hysteresis) until HP restored
+                                healing_target = cached_heal_dir
+                                if self.step_count % 50 == 0:
+                                    logger.info(f"🔄 HYSTERESIS: Sticking with cached healing dir: {cached_heal_dir['type']}")
+                            else:
+                                # First time choosing OR HP restored - pick based on current position
+                                if y < 15:  # Closer to Oldale
+                                    healing_target = {'type': 'OLDALE_PC', 'action': 'GO_NORTH', 'coords': None}
+                                else:  # Closer to Littleroot/Mom
+                                    healing_target = {'type': 'MOM', 'action': 'GO_SOUTH', 'coords': None}
+                                # Cache this direction for hysteresis
+                                self._cached_healing_direction = healing_target
+                                logger.info(f"🎯 HEALING DIR CHOSEN: {healing_target['type']} (y={y})")
                         elif 'LITTLEROOT' in location_upper:
                             # In Littleroot - go to player's house for Mom
-                            healing_target = {'type': 'PLAYER_HOUSE', 'action': 'ENTER_HOUSE', 'coords': (5, 4)}
+                            # GENDER-AWARE: Girl's house is May's (14,9), Boy's is Brendan's (8,8)
+                            player_gender_heal = memory.get('player', {}).get('gender', 'Boy')
+                            if player_gender_heal == 'Girl':
+                                # May's house door
+                                healing_target = {'type': 'PLAYER_HOUSE', 'action': 'ENTER_HOUSE', 'coords': (14, 9)}
+                            else:
+                                # Brendan's house door
+                                healing_target = {'type': 'PLAYER_HOUSE', 'action': 'ENTER_HOUSE', 'coords': (8, 8)}
                         else:
                             # Default: head south to find healing
                             healing_target = {'type': 'FIND_HEALING', 'action': 'DOWN', 'coords': None}
@@ -1339,6 +2900,10 @@ def main():
                     
                     memory['healing_interrupt'] = healing_interrupt_active
                     memory['healing_target'] = healing_target
+                    
+                    # Cache for UNIVERSAL HEALING OVERRIDE in process_action()
+                    self.cached_healing_interrupt = healing_interrupt_active
+                    self.cached_healing_target = healing_target
                     
                     # ═══════════════════════════════════════════════════════════════════
                     # 🚪 FORCED HOUSE EXIT - DISABLED - Now handled by directive SLAM pathfinding
@@ -1355,6 +2920,7 @@ def main():
                     in_lab = 'LAB' in location_upper or 'BIRCH' in location_upper
                     in_pokecenter = map_id == 0x200 or 'POKEMON CENTER' in location_upper or 'POKECENTER' in location_upper
                     in_pokecenter_2f = 'POKEMON CENTER' in location_upper and '2F' in location_upper
+                    in_mart = map_id == 0x202 or (map_id == 0 and 'MART' in location_upper) or 'MART' in location_upper
                     
                     force_house_exit = has_starter and in_house and not in_lab and not in_pokecenter
                     house_exit_target = None  # DISABLED - let directive system handle it
@@ -1365,6 +2931,107 @@ def main():
                     memory['house_exit_target'] = house_exit_target  # Will be None
                     
                     # ═══════════════════════════════════════════════════════════════════
+                    # 🗺️ GLOBAL TERRAIN HELPER - Used by ALL maps for ground truth navigation
+                    # Parses visual_map ASCII (arrows=ledges, #=obstacles) + metatile_info
+                    # ═══════════════════════════════════════════════════════════════════
+                    
+                    # Get terrain data ONCE for all map handlers
+                    map_data = memory.get('map_data', {})
+                    metatile_info = map_data.get('metatile_info', [])
+                    
+                    # Cache position and terrain for HOUSE OVERRIDE (used at start of next step)
+                    self.cached_position = (x, y, map_id)
+                    self.cached_metatile = metatile_info
+                    
+                    def is_direction_walkable(direction):
+                        """GLOBAL: Check if moving in direction is blocked by terrain
+                        
+                        Uses ground truth from server:
+                        - visual_map ASCII: arrows (↓↘←→) = ledges, # = obstacles, . = passable
+                        - metatile_info: IMPASSABLE, JUMP_* behaviors
+                        
+                        Works for ALL maps, not just Route 101!
+                        """
+                        if not metatile_info or len(metatile_info) < 15:
+                            return None  # No terrain data available
+                        
+                        # Player is at center of 15x15 grid = position (7, 7)
+                        center = 7
+                        offsets = {'UP': (0, -1), 'DOWN': (0, 1), 'LEFT': (-1, 0), 'RIGHT': (1, 0)}
+                        dx, dy = offsets.get(direction, (0, 0))
+                        
+                        try:
+                            tile_info = metatile_info[center + dy][center + dx]
+                            behavior = tile_info.get('behavior', 'NORMAL')
+                            passable = tile_info.get('passable', True)
+                            
+                            # === ALSO CHECK VISUAL_MAP for arrow symbols (ground truth!) ===
+                            visual_map = map_data.get('visual_map', '')
+                            if visual_map:
+                                lines = visual_map.split('\n')
+                                # Find player 'P' in visual_map to get relative position
+                                for line_idx, line in enumerate(lines):
+                                    if 'P' in line:
+                                        p_col = line.find('P')
+                                        # Check adjacent tile for arrow
+                                        target_line_idx = line_idx + dy
+                                        target_col = p_col + dx * 2  # ASCII uses 2 chars per tile
+                                        if 0 <= target_line_idx < len(lines) and 0 <= target_col < len(lines[target_line_idx]):
+                                            char = lines[target_line_idx][target_col:target_col+1]
+                                            # Ledge arrows - BLOCK going UP against DOWN ledge
+                                            if char in '↓vV' and direction == 'UP':
+                                                return False  # Can't climb UP a DOWN ledge!
+                                            if char in '↑^' and direction == 'DOWN':
+                                                return False  # Can't climb DOWN an UP ledge!
+                                            if char in '←<' and direction == 'RIGHT':
+                                                return False  # Can't go RIGHT into LEFT ledge!
+                                            if char in '→>' and direction == 'LEFT':
+                                                return False  # Can't go LEFT into RIGHT ledge!
+                                            if char in '↘' and direction in ['UP', 'LEFT']:
+                                                return False  # Can't climb SE ledge from N or W!
+                                            if char in '↙' and direction in ['UP', 'RIGHT']:
+                                                return False  # Can't climb SW ledge!
+                                            if char == '#':
+                                                return False  # Obstacle!
+                                        break
+                            
+                            # === IMPASSABLE (Trees, walls) - totally blocked ===
+                            if 'IMPASSABLE' in behavior:
+                                return False
+                            
+                            # === LEDGES (arrows in ground truth) - one-way only! ===
+                            if 'JUMP_SOUTH' in behavior:
+                                return direction == 'DOWN'
+                            if 'JUMP_NORTH' in behavior:
+                                return direction == 'UP'
+                            if 'JUMP_EAST' in behavior:
+                                return direction == 'RIGHT'
+                            if 'JUMP_WEST' in behavior:
+                                return direction == 'LEFT'
+                            if 'JUMP_SOUTHEAST' in behavior:
+                                return direction in ['DOWN', 'RIGHT']
+                            if 'JUMP_SOUTHWEST' in behavior:
+                                return direction in ['DOWN', 'LEFT']
+                            if 'JUMP' in behavior:
+                                return direction == 'DOWN'  # Assume south-facing
+                            
+                            # === GRASS - walkable! ===
+                            if 'GRASS' in behavior:
+                                return True
+                            
+                            return passable
+                            
+                        except (IndexError, KeyError, TypeError):
+                            return None
+                    
+                    # Check all directions using GLOBAL helper (available to all map handlers!)
+                    can_up = is_direction_walkable('UP')
+                    can_down = is_direction_walkable('DOWN')
+                    can_left = is_direction_walkable('LEFT')
+                    can_right = is_direction_walkable('RIGHT')
+                    
+                    # ═══════════════════════════════════════════════════════════════════
+
                     # 🧱 ROUTE 101 WAYPOINT NAVIGATION SYSTEM
                     # Comprehensive path planning for Route 101 ledge + tree obstacles.
                     # 
@@ -1384,76 +3051,18 @@ def main():
                     ledge_target = None
                     
                     if 'ROUTE' in location_upper and '101' in location_upper:
-                        route101_ledge_interrupt = True  # Always active on Route 101
+                        # DISABLED: Let terrain A* handle Route 101 navigation using ground truth
+                        # The server provides real-time metatile data (. = walkable, # = blocked, etc.)
+                        # which is more accurate than hardcoded zone logic
+                        route101_ledge_interrupt = False  # Use terrain A* with ground truth!
                         
-                        # === USE GROUND TRUTH TERRAIN DATA ===
-                        # Server provides 15x15 metatile grid centered on player (position 7,7)
-                        # Check which directions are walkable vs blocked
-                        map_data = memory.get('map_data', {})
-                        metatile_info = map_data.get('metatile_info', [])
-                        
-                        # Helper to check if a direction is walkable (uses server terrain)
-                        def is_direction_walkable(direction):
-                            """Check if moving in direction is blocked by terrain
-                            
-                            Ground truth symbols (from user):
-                            - Arrows (↓) = Ledges = JUMP_SOUTH, JUMP_EAST, etc. - one-way!
-                            - Dashes (-) = Grass = TALL_GRASS, LONG_GRASS - walkable!
-                            - Blocked = Trees = IMPASSABLE_* - cannot pass!
-                            """
-                            if not metatile_info or len(metatile_info) < 15:
-                                return None  # No terrain data available
-                            
-                            # Player is at center of 15x15 grid = position (7, 7)
-                            center = 7
-                            offsets = {'UP': (0, -1), 'DOWN': (0, 1), 'LEFT': (-1, 0), 'RIGHT': (1, 0)}
-                            dx, dy = offsets.get(direction, (0, 0))
-                            
-                            try:
-                                tile_info = metatile_info[center + dy][center + dx]
-                                behavior = tile_info.get('behavior', 'NORMAL')
-                                passable = tile_info.get('passable', True)
-                                
-                                # === IMPASSABLE (Trees, walls) - totally blocked ===
-                                if 'IMPASSABLE' in behavior:
-                                    return False
-                                
-                                # === LEDGES (arrows in ground truth) - one-way only! ===
-                                # JUMP_SOUTH means you can only GO south (down), not climb up
-                                if 'JUMP_SOUTH' in behavior:
-                                    return direction == 'DOWN'  # Can only go DOWN
-                                if 'JUMP_NORTH' in behavior:
-                                    return direction == 'UP'
-                                if 'JUMP_EAST' in behavior:
-                                    return direction == 'RIGHT'
-                                if 'JUMP_WEST' in behavior:
-                                    return direction == 'LEFT'
-                                if 'JUMP_SOUTHEAST' in behavior:
-                                    return direction in ['DOWN', 'RIGHT']
-                                if 'JUMP_SOUTHWEST' in behavior:
-                                    return direction in ['DOWN', 'LEFT']
-                                if 'JUMP' in behavior:  # Generic ledge
-                                    return direction == 'DOWN'  # Assume south-facing
-                                
-                                # === GRASS (dashes in ground truth) - walkable! ===
-                                if 'GRASS' in behavior:
-                                    return True  # Grass is always walkable
-                                
-                                # === NORMAL tiles - check passable flag ===
-                                return passable
-                                
-                            except (IndexError, KeyError, TypeError):
-                                return None  # Error reading terrain
-                        
-                        # Check all directions
-                        can_up = is_direction_walkable('UP')
-                        can_down = is_direction_walkable('DOWN')
-                        can_left = is_direction_walkable('LEFT')
-                        can_right = is_direction_walkable('RIGHT')
+                        # Uses GLOBAL is_direction_walkable and can_up/can_down/can_left/can_right
+                        # defined above (before all map handlers)
                         
                         # Log terrain status every 50 steps for debugging
                         if self.step_count % 50 == 0:
                             logger.info(f"🗺️ Route 101 ({x},{y}) Terrain: UP={can_up} DOWN={can_down} LEFT={can_left} RIGHT={can_right}")
+
                         
                         # ═══════════════════════════════════════════════════════════════════
                         # 🗺️ ROUTE 101 WAYPOINT PATHFINDING - RE-ENABLED
@@ -1478,80 +3087,104 @@ def main():
                         # - Left side / Oldale path (x<=8, y<=10): Go UP to Oldale!  
                         # - Lower area (y>15): Go UP through grass
                         
-                        in_middle_ledge = 7 <= x <= 10 and 6 <= y <= 9  # LEDGE TRAP - go DOWN!
+                        # PRIORITY OVERRIDE: If has Pokedex, ALWAYS go UP to Oldale (then Route 102)
+                        # This bypasses ledge escape logic since we need to go NORTH
+                        has_pokedex = memory.get('has_pokedex', False)
+                        
+                        # Ledge trap is ONLY on the right side (x>=9) where you might jump down
+                        # Central corridor (x=7-8) is CLEAR - UP works!
+                        # Left path (x<=6) has its own navigation
+                        in_middle_ledge = x >= 9 and 6 <= y <= 9  # LEDGE TRAP - narrowed bounds
                         in_upper_right = x >= 10 and y <= 8   # Passed the turn, go LEFT!
                         on_left_oldale_path = x <= 8 and y <= 10  # Left side path to Oldale - go UP!
                         at_oldale_entrance = y <= 3  # Very close to Oldale, go UP!
                         
-                        if at_oldale_entrance:
+                        # POKEDEX OVERRIDE: Already visited lab, need to go NORTH to Oldale->Route102
+                        # BUT: Must respect terrain! If UP is blocked, use terrain result
+                        # CRITICAL: If in upper-right, must go LEFT first (passed the turn!)
+                        # CRITICAL: If in middle ledge trap, MUST go DOWN to escape first!
+                        if has_pokedex:
+                            if in_upper_right and can_left:
+                                # PASSED THE TURN! Must go LEFT (west) to find Oldale entrance
+                                ledge_target = {'action': 'LEFT', 'reason': f'Has Pokedex but at x={x}>=10! Go LEFT to find Oldale entrance!'}
+                                if self.step_count % 30 == 0:
+                                    logger.info(f"🚨 UPPER RIGHT ({x},{y}): Must go LEFT to reach Oldale entrance!")
+                            elif in_middle_ledge and can_down:
+                                # IN LEDGE TRAP! Must go DOWN to escape before going UP to Oldale
+                                ledge_target = {'action': 'DOWN', 'reason': f'Has Pokedex but STUCK at y={y}! GO DOWN to escape ledge trap!'}
+                                if self.step_count % 20 == 0:
+                                    logger.info(f"🚨 LEDGE ESCAPE: At ({x},{y}) in middle ledge - must go DOWN first!")
+                            elif can_up:
+                                ledge_target = {'action': 'UP', 'reason': f'Has Pokedex! Go UP to Oldale->Route102'}
+                            elif can_left:
+                                ledge_target = {'action': 'LEFT', 'reason': f'Has Pokedex! UP blocked, go LEFT'}
+                            elif can_right:
+                                ledge_target = {'action': 'RIGHT', 'reason': f'Has Pokedex! UP blocked, go RIGHT'}
+                            else:
+                                # Let TerrainNavigator A* handle complex path
+                                ledge_target = None  # Disable zone override, use A*
+
+                        elif at_oldale_entrance:
+
+
                             # Very close to Oldale entrance - just go UP!
                             ledge_target = {'action': 'UP', 'reason': f'At Oldale entrance y={y} - GO UP!'}
                         
                         elif in_middle_ledge:
-                            # CRITICAL FIX: Middle ledge trap at y=6-9!
-                            # Agent oscillates LEFT/RIGHT at y=7 because ledge blocks UP
-                            # Solution: Go DOWN to get below ledge (y>=10), then navigate around
-                            if y < 9 and can_down is True:
-                                ledge_target = {'action': 'DOWN', 'reason': f'LEDGE TRAP at ({x},{y}) - GO DOWN to escape!'}
-                            elif y >= 9 and can_left is True:
-                                # Below ledge now - go LEFT to get to left path
-                                ledge_target = {'action': 'LEFT', 'reason': f'Below ledge at ({x},{y}) - go LEFT to path!'}
-                            elif can_down is True:
-                                ledge_target = {'action': 'DOWN', 'reason': 'Continue DOWN to escape ledge zone'}
-                            else:
-                                ledge_target = {'action': 'LEFT', 'reason': 'Force LEFT to find path'}
-                        
+                            # Middle ledge zone (x>=9, y=6-9) with trees blocking
+                            # DEFER TO TERRAIN A* - it has real metatile data!
+                            # Only fall back to hardcoded if terrain nav fails
+                            # The A* will find path around ledge/trees better than hardcoded logic
+                            ledge_target = None  # Disable waypoint, let terrain nav handle it
+                            if self.step_count % 100 == 0:
+                                logger.info(f"🚧 LEDGE ZONE ({x},{y}): Deferring to terrain A* for navigation")
+                         
                         elif on_left_oldale_path:
-                            # On the left side path to Oldale - go UP!
-                            # This is where the agent was getting stuck at (2-4, 8)
-                            if can_up is True:
-                                ledge_target = {'action': 'UP', 'reason': f'Left path x={x},y={y} - go UP to Oldale!'}
-                            elif can_right is True:
-                                ledge_target = {'action': 'RIGHT', 'reason': 'UP blocked on left path, try RIGHT'}
-                            else:
-                                ledge_target = {'action': 'UP', 'reason': 'Force UP to Oldale!'}
+                            # Left side path to Oldale (x<=8, y<=10)
+                            # DEFER TO TERRAIN A* - it knows about trees and ledges!
+                            # The A* will find the correct path around obstacles
+                            ledge_target = None  # Let terrain nav handle it
+                            if self.step_count % 100 == 0:
+                                logger.info(f"🚧 LEFT PATH ({x},{y}): Deferring to terrain A* for navigation")
                         
                         elif in_upper_right:
-                            # CRITICAL: In upper-right area. Per U-shape, must go LEFT!
-                            # Oldale entrance is at x~5-8, we're at x>=10
-                            if can_left is True:
-                                ledge_target = {'action': 'LEFT', 'reason': f'Upper-right x={x}, go LEFT to Oldale entrance!'}
-                            elif can_up is True:
-                                ledge_target = {'action': 'UP', 'reason': 'LEFT blocked, try UP'}
-                            elif can_down is True:
-                                ledge_target = {'action': 'DOWN', 'reason': 'Try DOWN to find path'}
-                            else:
-                                ledge_target = {'action': 'LEFT', 'reason': 'Force LEFT to Oldale!'}
+                            # Upper-right area (x>=10, y<=8)
+                            # DEFER TO TERRAIN A* - it can find path around trees/obstacles
+                            ledge_target = None
+                            if self.step_count % 100 == 0:
+                                logger.info(f"🚧 UPPER-RIGHT ({x},{y}): Deferring to terrain A* for navigation")
                         
-                        elif can_up is True:
-                            # Default: If UP is clear, go UP
-                            ledge_target = {'action': 'UP', 'reason': 'Terrain: UP clear - GO NORTH!'}
+                        # NOTE: If ledge_target is already set (from zones above), skip fallback
+                        # If ledge_target is None from zone, KEEP it None to defer to terrain A*!
+                        # Only use fallback if no zone matched at all
+                        defer_to_terrain = (in_middle_ledge or on_left_oldale_path or in_upper_right)
                         
-                        elif can_up is False:
-                            # UP blocked (ledge) - navigate around based on position
-                            if x >= 8:
-                                # Right side - try LEFT first
-                                if can_left is True:
-                                    ledge_target = {'action': 'LEFT', 'reason': 'UP blocked right side, go LEFT'}
-                                elif can_right is True:
-                                    ledge_target = {'action': 'RIGHT', 'reason': 'Try RIGHT'}
+                        if not defer_to_terrain and ledge_target is None:
+                            # FALLBACK: Only when no zone matched - use simple heuristics
+                            if can_up is True:
+                                ledge_target = {'action': 'UP', 'reason': 'Terrain: UP clear - GO NORTH!'}
+                            elif can_up is False:
+                                # UP blocked - navigate around
+                                if x >= 8:
+                                    if can_left is True:
+                                        ledge_target = {'action': 'LEFT', 'reason': 'UP blocked, go LEFT'}
+                                    elif can_right is True:
+                                        ledge_target = {'action': 'RIGHT', 'reason': 'Try RIGHT'}
+                                    else:
+                                        ledge_target = {'action': 'DOWN', 'reason': 'Try DOWN'}
                                 else:
-                                    ledge_target = {'action': 'DOWN', 'reason': 'Try DOWN'}
-                            else:
-                                # Left side - try RIGHT first
-                                if can_right is True:
-                                    ledge_target = {'action': 'RIGHT', 'reason': 'UP blocked left side, go RIGHT'}
-                                elif can_down is True:
-                                    ledge_target = {'action': 'DOWN', 'reason': 'Try DOWN'}
+                                    if can_right is True:
+                                        ledge_target = {'action': 'RIGHT', 'reason': 'UP blocked, go RIGHT'}
+                                    elif can_down is True:
+                                        ledge_target = {'action': 'DOWN', 'reason': 'Try DOWN'}
+                                    else:
+                                        ledge_target = {'action': 'UP', 'reason': 'Force UP'}
+                            elif can_up is None:
+                                # No terrain data - use position fallback
+                                if x >= 10:
+                                    ledge_target = {'action': 'LEFT', 'reason': 'No terrain, x>=10 - go LEFT'}
                                 else:
-                                    ledge_target = {'action': 'UP', 'reason': 'Force UP'}
-                        
-                        else:
-                            # No terrain data - use position fallback
-                            if x >= 10:
-                                ledge_target = {'action': 'LEFT', 'reason': 'No terrain, x>=10 - go LEFT'}
-                            else:
-                                ledge_target = {'action': 'UP', 'reason': 'No terrain - go UP'}
+                                    ledge_target = {'action': 'UP', 'reason': 'No terrain - go UP'}
                         
                         if route101_ledge_interrupt and ledge_target and self.step_count % 30 == 0:
                             logger.info(f"🧱 TERRAIN NAV! Pos=({x},{y}) -> {ledge_target['action']} - {ledge_target['reason']}")
@@ -1567,49 +3200,62 @@ def main():
                     oldale_pokecenter_nav = False
                     oldale_target = None
                     
-                    if 'OLDALE' in location_upper and 'POKECENTER' not in location_upper:
+                    # Check if in outdoor Oldale (not inside any building)
+                    in_oldale_outdoor = 'OLDALE' in location_upper and \
+                                        'POKECENTER' not in location_upper and \
+                                        'POKEMON CENTER' not in location_upper and \
+                                        'CENTER' not in location_upper and \
+                                        '2F' not in location_upper and \
+                                        '1F' not in location_upper and \
+                                        'HOUSE' not in location_upper and \
+                                        'MART' not in location_upper
+                    
+                    if in_oldale_outdoor:
+
                         # Check if we already visited PokeCenter
                         if not getattr(self, 'visited_oldale_pokecenter', False):
                             oldale_pokecenter_nav = True
                             
-                            # PokeCenter is at (7, 13) in Oldale Town
-                            pc_x, pc_y = 7, 13
+                            # PokeCenter entrance is at (6, 17) in Oldale Town - SERVER GROUND TRUTH
+                            pc_x, pc_y = 6, 17
                             
-                            # Calculate direction to PokeCenter
-                            if abs(x - pc_x) > abs(y - pc_y):
-                                # Horizontal distance greater - move horizontally first
-                                if x < pc_x:
-                                    oldale_target = {'action': 'RIGHT', 'reason': f'Go RIGHT to PokeCenter ({pc_x},{pc_y})'}
-                                elif x > pc_x:
-                                    oldale_target = {'action': 'LEFT', 'reason': f'Go LEFT to PokeCenter ({pc_x},{pc_y})'}
+                            # USE TERRAIN_NAV A* PATHFINDING with obstacle awareness!
+                            # This uses metatile_info to navigate around buildings
+                            metatile_info = getattr(self, 'cached_metatile', None)
+                            if hasattr(self, 'terrain_nav') and metatile_info:
+                                nav_result = self.terrain_nav.get_direction(
+                                    map_id=map_id,
+                                    x=x, y=y,
+                                    goal=(pc_x, pc_y),
+                                    metatile_info=metatile_info
+                                )
+                                if nav_result:
+                                    oldale_target = nav_result
+                                    if self.step_count % 30 == 0:
+                                        logger.info(f"🏥 OLDALE A* NAV! Pos=({x},{y}) -> {oldale_target['action']} - {oldale_target['reason']}")
                                 else:
-                                    # Same x - move vertically
+                                    # A* failed - fallback to simple direction
                                     if y < pc_y:
-                                        oldale_target = {'action': 'DOWN', 'reason': f'Go DOWN to PokeCenter ({pc_x},{pc_y})'}
+                                        oldale_target = {'action': 'DOWN', 'reason': f'A* failed, simple DOWN to ({pc_x},{pc_y})'}
                                     else:
-                                        oldale_target = {'action': 'UP', 'reason': f'Go UP to PokeCenter ({pc_x},{pc_y})'}
+                                        oldale_target = {'action': 'UP', 'reason': f'A* failed, simple UP to ({pc_x},{pc_y})'}
+                                    logger.warning(f"⚠️ OLDALE A* FAILED at ({x},{y}), using simple fallback")
                             else:
-                                # Vertical distance greater - move vertically first
+                                # No terrain_nav - use simple direction
                                 if y < pc_y:
-                                    oldale_target = {'action': 'DOWN', 'reason': f'Go DOWN to PokeCenter ({pc_x},{pc_y})'}
-                                elif y > pc_y:
-                                    oldale_target = {'action': 'UP', 'reason': f'Go UP to PokeCenter ({pc_x},{pc_y})'}
+                                    oldale_target = {'action': 'DOWN', 'reason': f'No A*, simple DOWN to ({pc_x},{pc_y})'}
                                 else:
-                                    # Same y - move horizontally
-                                    if x < pc_x:
-                                        oldale_target = {'action': 'RIGHT', 'reason': f'Go RIGHT to PokeCenter ({pc_x},{pc_y})'}
-                                    else:
-                                        oldale_target = {'action': 'LEFT', 'reason': f'Go LEFT to PokeCenter ({pc_x},{pc_y})'}
+                                    oldale_target = {'action': 'UP', 'reason': f'No A*, simple UP to ({pc_x},{pc_y})'}
                             
                             # At PokeCenter door? Go UP to enter!
                             if abs(x - pc_x) <= 1 and abs(y - pc_y) <= 1:
                                 oldale_target = {'action': 'UP', 'reason': 'At PokeCenter door - ENTER!'}
-                            
-                            if self.step_count % 30 == 0:
-                                logger.info(f"🏥 OLDALE NAV! Pos=({x},{y}) -> {oldale_target['action']} - {oldale_target['reason']}")
                     
                     memory['oldale_pokecenter_nav'] = oldale_pokecenter_nav
                     memory['oldale_target'] = oldale_target
+                    # Cache for STUCK OVERRIDE access at step start
+                    if oldale_target:
+                        self._cached_oldale_target = oldale_target
                     
                     # ═══════════════════════════════════════════════════════════════════
                     # 💊 POKECENTER INTERIOR: TALK TO NURSE JOY
@@ -1622,15 +3268,25 @@ def main():
                     nurse_target = None
                     
                     # map_id 0x200 = Oldale PokeCenter INTERIOR (ground truth)
-                    if map_id == 0x200:
+                    # BUT: Disable on 2F - nurse is on 1F only!
+                    if map_id == 0x200 and not in_pokecenter_2f:
                         nurse_joy_nav = True
                         
-                        # Nurse Joy counter is at approximately (7, 3) in PokeCenter
-                        nurse_x, nurse_y = 7, 3
+                        # Nurse Joy counter is at (7, 3) - AGENT NEEDS TO BE AT (7, 4) TO INTERACT!
+                        # ESCALATOR to 2F is on LEFT side at x=1-2 - AVOID!
+                        nurse_x, nurse_y = 7, 4  # Target (7,4) - one tile in front of counter
+                        escalator_danger_zone = x <= 3  # Too far left = escalator danger!
                         
-                        if y > nurse_y + 1:
-                            # Need to go UP to reach counter
-                            nurse_target = {'action': 'UP', 'reason': f'Go UP to Nurse Joy counter (at y={nurse_y})'}
+                        if escalator_danger_zone:
+                            # PRIORITY: Get away from escalator area!
+                            nurse_target = {'action': 'RIGHT', 'reason': f'DANGER: Near 2F escalator at x={x}! Go RIGHT to nurse area!'}
+                        elif y > nurse_y + 1:
+                            # Need to go UP to reach counter (but not too far left)
+                            if x < 5:
+                                # Go RIGHT first to avoid escalator path
+                                nurse_target = {'action': 'RIGHT', 'reason': f'Go RIGHT to center before approaching nurse'}
+                            else:
+                                nurse_target = {'action': 'UP', 'reason': f'Go UP to Nurse Joy counter (at y={nurse_y})'}
                         elif abs(x - nurse_x) > 1:
                             # Need to move horizontally to align with counter
                             if x < nurse_x:
@@ -1646,6 +3302,7 @@ def main():
                     
                     memory['nurse_joy_nav'] = nurse_joy_nav
                     memory['nurse_target'] = nurse_target
+
                     
                     # ═══════════════════════════════════════════════════════════════════
                     # 🗺️ ROUTE 103: TERRAIN-BASED NAVIGATION TO FIND RIVAL
@@ -1655,17 +3312,44 @@ def main():
                     route103_nav = False
                     route103_target = None
                     
-                    if 'ROUTE' in location_upper and '103' in location_upper:
-                        # DISABLED: Use Unified TerrainNavigator instead!
-                        route103_nav = False
-                        # route103_nav = True
+                    if 'ROUTE' in location_upper and '103' in location_upper and not rival_battled:
+                        # ONLY enable rival-finding navigation if rival NOT yet beaten!
+                        # After battle won, terrain_goal at line 2051+ handles going back to Oldale
+                        
+                        # PRIORITY 1: Check HP - if too low, go back to Oldale PokeCenter!
+                        route103_hp_low = False
+                        try:
+                            party_data = memory.get('party', []) or progress_ctx.get('party', [])
+                            if party_data and len(party_data) > 0:
+                                lead = party_data[0]
+                                hp = lead.get('current_hp', lead.get('hp', 0))
+                                max_hp = lead.get('max_hp', 1) or 1
+                                hp_pct = (hp / max_hp) * 100
+                                if hp_pct < 50:
+                                    route103_hp_low = True
+                                    if self.step_count % 50 == 0:
+                                        logger.warning(f"🩺 ROUTE 103: HP too low ({hp_pct:.0f}%)! Redirecting to Oldale PokeCenter!")
+                        except:
+                            pass
+                        
+                        if route103_hp_low:
+                            # Override: Go to Oldale to heal (entrance is SOUTH at y > 10)
+                            route103_target = {'action': 'DOWN', 'reason': f'HP LOW! Go to Oldale PokeCenter to heal!'}
+                            route103_nav = True
+                        else:
+                            route103_nav = True
+
                         
                         # Use terrain data for ledge detection
                         map_data = memory.get('map_data', {})
                         metatile_info = map_data.get('metatile_info', [])
                         
-                        # Rival is typically at east side of Route 103 (around x=25)
-                        rival_x = 25
+                        # Route 103 Layout:
+                        # - Entrance from Oldale is on WEST side (x~0-5)
+                        # - Rival (May/Brendan) is on EAST side (x~25-30)
+                        # - LEDGES block upward movement in middle areas
+                        # - Must go RIGHT (east) staying on lower path to reach rival
+                        rival_x = 28  # Rival location approximately
                         
                         # Check terrain in desired direction
                         def check_route103_terrain(direction):
@@ -1682,7 +3366,7 @@ def main():
                                 # Impassable tiles
                                 if 'IMPASSABLE' in behavior:
                                     return False
-                                # Ledges - one way only
+                                # Ledges - one way only (can only jump DOWN from ledge)
                                 if 'JUMP_SOUTH' in behavior:
                                     return direction == 'DOWN'
                                 if 'JUMP' in behavior:
@@ -1698,39 +3382,113 @@ def main():
                         can_up = check_route103_terrain('UP')
                         can_down = check_route103_terrain('DOWN')
                         
-                        # Priority: Go RIGHT (east) to find rival, avoid ledges
-                        if x < rival_x - 5:
-                            # Need to go east to reach rival
-                            if can_right is True:
-                                route103_target = {'action': 'RIGHT', 'reason': 'Go EAST to find rival'}
-                            elif can_up is True:
-                                route103_target = {'action': 'UP', 'reason': 'RIGHT blocked, try UP'}
-                            elif can_down is True:
-                                route103_target = {'action': 'DOWN', 'reason': 'Try DOWN to find path'}
+                        # ═══════════════════════════════════════════════════════════════
+                        # ROUTE 103 ZONES (similar to Route 101 logic)
+                        # 
+                        # Zone 1: WEST ENTRANCE (x < 8) - Just entered from Oldale
+                        #         Priority: Go RIGHT to reach rival
+                        #
+                        # Zone 2: LEDGE TRAP (8 <= x <= 20, y < 8) - Ledges block path
+                        #         Priority: Go DOWN to get below ledges, then RIGHT
+                        #
+                        # Zone 3: EAST RIVAL AREA (x > 20) - Rival location
+                        #         Priority: Search for rival, press A to battle
+                        # ═══════════════════════════════════════════════════════════════
+                        # ROUTE 103 ZONES - CORRECTED LAYOUT
+                        # 
+                        # Entrance from Oldale is on EAST (RIGHT) side (x > 18)
+                        # Rival is on WEST (LEFT) side (x < 10, near top y < 8)
+                        # 
+                        # Zone 1: EAST ENTRANCE (x > 18) - Just entered from Oldale
+                        #         Priority: Go LEFT toward rival
+                        #
+                        # Zone 2: MIDDLE AREA (10 <= x <= 18) - Navigate through
+                        #         Priority: Go LEFT, avoid ledges by going down
+                        #
+                        # Zone 3: WEST RIVAL AREA (x < 10) - Rival location (top-left)
+                        #         Priority: Go UP to find rival, press A to battle
+                        # ═══════════════════════════════════════════════════════════════
+                        
+                        in_east_entrance = x > 18  # Just entered from Oldale
+                        in_middle_area = 15 <= x <= 18  # Narrower middle zone
+                        in_rival_area = x < 15  # Rival is slight left/center (not far left)
+                        
+                        if in_rival_area:
+                            # In rival area (slight left/center) - search for rival
+                            # Rival is toward left-center top, prioritize UP then LEFT
+                            if y > 5:
+                                # Need to go UP to reach rival
+                                if can_up is True:
+                                    route103_target = {'action': 'UP', 'reason': f'RIVAL ZONE ({x},{y}) - go UP to rival!'}
+                                elif can_left is True:
+                                    route103_target = {'action': 'LEFT', 'reason': f'RIVAL ZONE ({x},{y}) - go LEFT'}
+                                else:
+                                    route103_target = {'action': 'UP', 'reason': f'Force UP to rival'}
                             else:
-                                route103_target = {'action': 'RIGHT', 'reason': 'Force RIGHT towards rival'}
-                        elif x > rival_x + 5:
-                            # Overshot - go back west
+                                # Near top - search for rival (prioritize UP and A for talking)
+                                if can_up is True:
+                                    route103_target = {'action': 'UP', 'reason': f'RIVAL ZONE ({x},{y}) - search UP'}
+                                elif can_left is True:
+                                    route103_target = {'action': 'LEFT', 'reason': f'RIVAL ZONE ({x},{y}) - search LEFT'}
+                                else:
+                                    route103_target = {'action': 'A', 'reason': f'RIVAL ZONE ({x},{y}) - talk to rival!'}
+
+                        
+                        elif in_middle_area:
+                            # Middle area - go LEFT toward rival
+                            # Check for ledges (can't go up if ledge is there)
+                            if can_up is False and y < 8:
+                                # Ledge blocking - go DOWN to get around it
+                                if can_down is True:
+                                    route103_target = {'action': 'DOWN', 'reason': f'LEDGE BLOCK ({x},{y}) - go DOWN!'}
+                                elif can_left is True:
+                                    route103_target = {'action': 'LEFT', 'reason': f'LEDGE BLOCK ({x},{y}) - try LEFT'}
+                                else:
+                                    route103_target = {'action': 'DOWN', 'reason': f'Force DOWN to escape ledge'}
+                            else:
+                                # Path clear - go LEFT toward rival
+                                if can_left is True:
+                                    route103_target = {'action': 'LEFT', 'reason': f'MIDDLE ({x},{y}) - go LEFT to rival!'}
+                                elif can_up is True:
+                                    route103_target = {'action': 'UP', 'reason': f'MIDDLE ({x},{y}) - try UP'}
+                                elif can_down is True:
+                                    route103_target = {'action': 'DOWN', 'reason': f'MIDDLE ({x},{y}) - go DOWN then LEFT'}
+                                else:
+                                    route103_target = {'action': 'LEFT', 'reason': f'Force LEFT to rival'}
+                        
+                        elif in_east_entrance:
+                            # Just entered from Oldale (east side) - go LEFT toward rival
                             if can_left is True:
-                                route103_target = {'action': 'LEFT', 'reason': 'Go WEST, overshot rival area'}
-                            else:
-                                route103_target = {'action': 'UP', 'reason': 'Try UP to find path'}
-                        else:
-                            # In rival area - explore to find them
-                            if can_up is True:
-                                route103_target = {'action': 'UP', 'reason': 'In rival zone - search UP'}
-                            elif can_right is True:
-                                route103_target = {'action': 'RIGHT', 'reason': 'In rival zone - search RIGHT'}
+                                route103_target = {'action': 'LEFT', 'reason': f'EAST ENTRANCE ({x},{y}) - go LEFT to rival!'}
+                            elif can_up is True:
+                                route103_target = {'action': 'UP', 'reason': f'EAST ENTRANCE ({x},{y}) - go UP then LEFT'}
                             elif can_down is True:
-                                route103_target = {'action': 'DOWN', 'reason': 'In rival zone - search DOWN'}
+                                route103_target = {'action': 'DOWN', 'reason': f'EAST ENTRANCE ({x},{y}) - go DOWN then LEFT'}
                             else:
-                                route103_target = {'action': 'A', 'reason': 'In rival zone - try talking to NPC'}
+                                route103_target = {'action': 'LEFT', 'reason': f'Force LEFT towards rival'}
+                        
+                        else:
+                            # Fallback: Standard navigation toward rival (west side)
+                            if x > 10:
+                                if can_left is True:
+                                    route103_target = {'action': 'LEFT', 'reason': f'Go LEFT to rival (x={x})'}
+                                elif can_down is True:
+                                    route103_target = {'action': 'DOWN', 'reason': f'DOWN to find path to rival'}
+                                else:
+                                    route103_target = {'action': 'LEFT', 'reason': f'Force LEFT'}
+                            else:
+                                if can_up is True:
+                                    route103_target = {'action': 'UP', 'reason': f'Go UP to rival area'}
+                                else:
+                                    route103_target = {'action': 'LEFT', 'reason': f'Try LEFT to find rival'}
                         
                         if self.step_count % 30 == 0:
                             logger.info(f"🗺️ ROUTE 103 NAV! Pos=({x},{y}) -> {route103_target['action']} - {route103_target['reason']}")
                     
                     memory['route103_nav'] = route103_nav
                     memory['route103_target'] = route103_target
+
+
                     
                     # ═══════════════════════════════════════════════════════════════════
                     # 🧭 UNIFIED TERRAIN NAVIGATOR (Cached A* Pathfinding)
@@ -1755,66 +3513,147 @@ def main():
                     map_data = memory.get('map_data', {})
                     metatile_info = map_data.get('metatile_info', [])
                     
+                    # DEBUG: Log metatile_info status periodically
+                    if self.step_count % 200 == 0:
+                        has_metatile = len(metatile_info) > 0 if metatile_info else False
+                        metatile_rows = len(metatile_info) if metatile_info else 0
+                        visual_map = map_data.get('visual_map', '')[:100] if map_data else 'NONE'
+                        logger.info(f"🗺️ MAP DATA: metatile={metatile_rows} rows, has_data={has_metatile}, visual_map={visual_map[:50]}...")
+
+                    
                     # Goal selection based on map and state
                     # Sequences: Goal1 → Exit (for indoor maps)
                     
                     # CHECK 2F FIRST - more specific than map_id!
-                    # PokeCenter 2F has escalator on LEFT side at (1,6), access from (2,6)
-                    # Use DIRECT direction calculation for 2F (bypass TerrainNavigator)
+                    # PokeCenter 2F has escalator on LEFT side - use ground truth connections!
                     if in_pokecenter_2f:
-                        # On 2F - need to take escalator down
-                        # Escalator is at (1,6), you stand at (2,6) and go LEFT to use it
-                        escalator_access_x, escalator_access_y = 2, 6
+                        connections = memory.get('connections', [])
                         
-                        # Calculate direction directly - 2F is open, no obstacles
-                        if x == escalator_access_x and y == escalator_access_y:
-                            # At access point - go LEFT to step onto escalator
-                            pc2f_action = 'LEFT'
-                            pc2f_reason = 'At (2,5) - stepping LEFT onto escalator!'
+                        # PRIORITY 1: Ground truth exit from server connections
+                        dynamic_exit = None
+                        for conn in connections:
+                            to_loc = conn.get('to', '').upper()
+                            from_pos = conn.get('from_pos', [])
+                            if len(from_pos) >= 2:
+                                if '1F' in to_loc or ('POKECENTER' in to_loc and '2F' not in to_loc):
+                                    dynamic_exit = (int(from_pos[0]), int(from_pos[1]))
+                                    if self.step_count % 50 == 0:
+                                        logger.info(f"🎯 DYNAMIC 2F EXIT: Using server exit {dynamic_exit} to 1F")
+                                    break
+                        
+                        # PRIORITY 2: Fallback escalator position
+                        if dynamic_exit:
+                            escalator_x, escalator_y = dynamic_exit
                         else:
-                            # Move toward access point
-                            dx = escalator_access_x - x  # 2 - current_x
-                            dy = escalator_access_y - y  # 5 - current_y
-                            
-                            if abs(dx) > abs(dy):
-                                pc2f_action = 'LEFT' if dx < 0 else 'RIGHT'
-                            elif abs(dy) > 0:
-                                pc2f_action = 'UP' if dy < 0 else 'DOWN'
+                            escalator_x, escalator_y = 1, 6  # Actual escalator position
+                        
+                        terrain_goal = (escalator_x, escalator_y)
+                        
+                        # === USE A* WITH METATILE DATA FOR GROUND TRUTH SLAM ===
+                        # TerrainNavigator will find optimal path using real-time terrain
+                        a_star_result = self.terrain_nav.get_direction(
+                            map_id=0x201,  # PC 2F map ID
+                            x=x, y=y,
+                            goal=terrain_goal,
+                            metatile_info=metatile_info
+                        )
+                        
+                        if a_star_result:
+                            # A* found a path using ground truth!
+                            terrain_nav_result = a_star_result
+                            if self.step_count % 30 == 0:
+                                logger.info(f"🪜 PC 2F A*: ({x},{y}) -> {a_star_result['action']} | {a_star_result['reason']}")
+                        else:
+                            # A* failed - use heuristic fallback (DOWN first, then LEFT)
+                            if y < escalator_y:
+                                pc2f_action = 'DOWN'
+                                pc2f_reason = f'Heuristic: DOWN to row {escalator_y} (y={y})'
+                            elif x > escalator_x:
+                                pc2f_action = 'LEFT'
+                                pc2f_reason = f'Heuristic: LEFT to x={escalator_x} (x={x})'
                             else:
-                                pc2f_action = 'LEFT'  # Default toward escalator
-                            pc2f_reason = f'Heading to escalator access (2,5), dx={dx}, dy={dy}'
+                                pc2f_action = 'LEFT'
+                                pc2f_reason = 'Heuristic: Step onto escalator'
+                            terrain_nav_result = {'action': pc2f_action, 'reason': pc2f_reason}
+                            if self.step_count % 30 == 0:
+                                logger.info(f"🪜 PC 2F: ({x},{y}) -> {pc2f_action} | {pc2f_reason}")
                         
-                        # Set terrain nav result DIRECTLY (bypass TerrainNavigator for 2F)
-                        terrain_nav_result = {'action': pc2f_action, 'reason': pc2f_reason}
                         terrain_nav_active = True
-                        terrain_goal = (escalator_access_x, escalator_access_y)
-                        
-                        if self.step_count % 30 == 0:
-                            logger.info(f"🪜 PC 2F: ({x},{y}) -> {pc2f_action} | {pc2f_reason}")
+
+
                     
                     elif map_id == 0x11:  # OLDALE_TOWN (outdoor)
                         connections = memory.get('connections', [])
+                        has_pokedex = memory.get('has_pokedex', False)
                         
-                        if not getattr(self, 'visited_oldale_pokecenter', False):
-                            # Try dynamic exit to PokeCenter from connections
+                        # Check HP for healing decision
+                        lead_hp_percent = 100
+                        try:
+                            party_data = memory.get('party', []) or progress_ctx.get('party', [])
+                            if party_data and len(party_data) > 0:
+                                lead = party_data[0]
+                                hp = lead.get('current_hp', lead.get('hp', 0))
+                                max_hp = lead.get('max_hp', 1) or 1
+                                lead_hp_percent = (hp / max_hp) * 100
+                        except:
+                            pass
+                        
+                        # Priority 1: Heal if HP < 50% and haven't won rival battle yet
+                        if lead_hp_percent < 50 and not rival_battled:
+                            if self.step_count % 50 == 0:
+                                logger.info(f"🏥 OLDALE: HP low ({lead_hp_percent:.0f}%)! Going to PokeCenter before Route 103 battle!")
+                            dynamic_exit = self.get_exit_for_objective(connections, 'pokecenter')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                            else:
+                                terrain_goal = 'pokecenter'
+                            terrain_nav_active = True
+                        
+                        elif not getattr(self, 'visited_oldale_pokecenter', False):
+                            # Step 1: Visit PokeCenter first to set spawn point
                             dynamic_exit = self.get_exit_for_objective(connections, 'pokecenter')
                             if dynamic_exit:
                                 terrain_goal = dynamic_exit
                                 if self.step_count % 100 == 0:
                                     logger.info(f"🎯 DYNAMIC: Using server exit {dynamic_exit} to POKECENTER")
                             else:
-                                terrain_goal = 'pokecenter'  # Fallback to hardcoded
+                                terrain_goal = 'pokecenter'  # Fallback
                             terrain_nav_active = True
-                        else:
-                            # Try dynamic exit to Route 103 from connections
+                        
+                        elif not rival_battled:
+                            # Step 2: Head to Route 103 for rival battle (HP is OK)
                             dynamic_exit = self.get_exit_for_objective(connections, 'route103')
                             if dynamic_exit:
                                 terrain_goal = dynamic_exit
                                 if self.step_count % 100 == 0:
                                     logger.info(f"🎯 DYNAMIC: Using server exit {dynamic_exit} to ROUTE 103")
                             else:
-                                terrain_goal = 'route103_exit'  # Fallback to hardcoded
+                                terrain_goal = 'route103_exit'  # Fallback
                             terrain_nav_active = True
+                        
+                        elif not has_pokedex:
+                            # Step 3: Return to Littleroot (Route 101) for Birch's Lab
+                            dynamic_exit = self.get_exit_for_objective(connections, 'route101')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                                if self.step_count % 100 == 0:
+                                    logger.info(f"🎯 DYNAMIC: Using server exit {dynamic_exit} to ROUTE 101 (Lab)")
+                            else:
+                                terrain_goal = 'route101_exit'  # Fallback
+                            terrain_nav_active = True
+                        
+                        else:
+                            # Step 4: Has Pokedex! Head west to Route 102 -> Petalburg
+                            dynamic_exit = self.get_exit_for_objective(connections, 'route102')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                                if self.step_count % 100 == 0:
+                                    logger.info(f"🎯 DYNAMIC: Using server exit {dynamic_exit} to ROUTE 102")
+                            else:
+                                # Fallback: Route 102 is west of Oldale
+                                terrain_goal = 'route102_exit'  # Will be added to terrain nav
+                            terrain_nav_active = True
+
                     
                     elif map_id == 0x200:  # OLDALE_POKECENTER 1F interior
                         connections = memory.get('connections', [])
@@ -1834,42 +3673,338 @@ def main():
                             terrain_goal = 'nurse_joy'  # Need to heal first
                             terrain_nav_active = True
                     
-                    elif map_id == 0x10:  # ROUTE_101
-                        terrain_goal = 'oldale_entrance'
+                    # OLDALE_MART - just exit! No reason to stay in the mart
+                    elif map_id == 0x202 or (map_id == 0 and 'MART' in location_upper):
+                        # Use get_exit_for_objective with map_id override
+                        # The override returns (3,7) for map 0x202 -> oldale
+                        connections = memory.get('connections', [])
+                        current_map_id = 0x202 if map_id == 0x202 else (0x202 if 'MART' in location_upper else 0)
+                        
+                        dynamic_exit = self.get_exit_for_objective(connections, 'oldale', map_id=current_map_id)
+                        
+                        if dynamic_exit:
+                            terrain_goal = dynamic_exit
+                            if self.step_count % 100 == 0:
+                                logger.info(f"🏪 MART NAV: Using exit {terrain_goal} to OLDALE TOWN")
+                        else:
+                            terrain_goal = (3, 7)  # Ultimate fallback
+                            if self.step_count % 100 == 0:
+                                logger.info(f"🏪 MART NAV: Using fallback exit {terrain_goal}")
+                        
                         terrain_nav_active = True
                     
-                    elif map_id == 0x12:  # ROUTE_103
-                        connections = memory.get('connections', [])
+                    # OLDALE TOWN HOUSES (0x205, 0x206) - WRONG BUILDING! Exit immediately!
+                    # These are random houses, not PokeCenter. Force exit back to Oldale Town
+                    elif map_id in [0x205, 0x206] or ('OLDALE' in location_upper and 'HOUSE' in location_upper and 'POKECENTER' not in location_upper):
+                        # Log that we entered wrong building
+                        if self.step_count % 50 == 0:
+                            logger.warning(f"⚠️ WRONG BUILDING! Entered Oldale house (map={hex(map_id) if map_id else 'None'}) instead of PokeCenter! Exiting...")
                         
-                        if not rival_battled:
-                            terrain_goal = 'rival_area'
+                        # Use generic house exit - most houses have door at bottom
+                        connections = memory.get('connections', [])
+                        dynamic_exit = self.get_exit_for_objective(connections, 'oldale')
+                        
+                        if dynamic_exit:
+                            terrain_goal = dynamic_exit
+                        else:
+                            terrain_goal = (4, 8)  # Generic house door location
+                        
+                        terrain_nav_active = True
+                    
+                    # BIRCH_LAB - need to exit after getting Pokedex or starter
+                    elif map_id in [0x020C, 0x104] or 'LAB' in location_upper or 'BIRCH' in location_upper:
+                        # Lab exit is at (6, 12) - door at bottom center
+                        connections = memory.get('connections', [])
+                        current_map_id = 0x020C if map_id in [0x020C, 0x104] else 0x020C
+                        
+                        dynamic_exit = self.get_exit_for_objective(connections, 'littleroot', map_id=current_map_id)
+                        
+                        if dynamic_exit:
+                            terrain_goal = dynamic_exit
+                            if self.step_count % 20 == 0:
+                                logger.info(f"🧪 LAB NAV: pos=({x},{y}) goal={terrain_goal} map_id={hex(map_id) if map_id else 'None'}")
+                        else:
+                            terrain_goal = (6, 12)  # Fallback - door at bottom center
+                            if self.step_count % 20 == 0:
+                                logger.info(f"🧪 LAB NAV: pos=({x},{y}) goal={terrain_goal} (fallback) map_id={hex(map_id) if map_id else 'None'}")
+                        
+                        terrain_nav_active = True
+                    
+                    elif map_id == 0x10:  # ROUTE_101
+                        connections = memory.get('connections', [])
+                        has_pokedex = memory.get('has_pokedex', False)
+                        
+                        # Bidirectional navigation based on objective
+                        if rival_battled and not has_pokedex:
+                            # After rival, need to go SOUTH to Littleroot for Lab/Pokedex
+                            dynamic_exit = self.get_exit_for_objective(connections, 'littleroot')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                                if self.step_count % 100 == 0:
+                                    logger.info(f"🎯 DYNAMIC: Using server exit {dynamic_exit} to LITTLEROOT")
+                            else:
+                                terrain_goal = 'littleroot_entrance'  # Fallback: Go south
                             terrain_nav_active = True
                         else:
-                            # Return to Oldale after battle
+                            # Default: Go NORTH to Oldale (for PokeCenter, Route 103, or Route 102)
                             dynamic_exit = self.get_exit_for_objective(connections, 'oldale')
                             if dynamic_exit:
                                 terrain_goal = dynamic_exit
                                 if self.step_count % 100 == 0:
-                                    logger.info(f"🎯 DYNAMIC: Using server exit {dynamic_exit} to OLDALE TOWN")
+                                    logger.info(f"🎯 DYNAMIC: Using server exit {dynamic_exit} to OLDALE")
+                            else:
+                                terrain_goal = 'oldale_entrance'  # Fallback: Go north
+                            terrain_nav_active = True
+
+                    
+                    elif map_id == 0x12:  # ROUTE_103
+                        connections = memory.get('connections', [])
+                        
+                        # Log rival_battled status for debugging
+                        if self.step_count % 100 == 0:
+                            logger.info(f"📍 ROUTE 103: rival_battled={rival_battled}, completed_locally={self.completed_first_rival_battle_locally}")
+                        
+                        # CRITICAL: Check HP before battling rival - if too low, go heal first!
+                        lead_hp_percent = 100
+                        try:
+                            party_data = memory.get('party', []) or progress_ctx.get('party', [])
+                            if party_data and len(party_data) > 0:
+                                lead = party_data[0]
+                                hp = lead.get('current_hp', lead.get('hp', 0))
+                                max_hp = lead.get('max_hp', 1) or 1
+                                lead_hp_percent = (hp / max_hp) * 100
+                                if self.step_count % 50 == 0:
+                                    logger.info(f"🩺 R103 HP CHECK: lead_hp={hp}/{max_hp} = {lead_hp_percent:.0f}%")
+                            else:
+                                if self.step_count % 50 == 0:
+                                    logger.warning(f"🩺 R103 HP CHECK: No party data found! memory:{bool(memory.get('party'))} progress:{bool(progress_ctx.get('party'))}")
+                        except Exception as e:
+                            if self.step_count % 50 == 0:
+                                logger.warning(f"🩺 R103 HP CHECK: Exception: {e}")
+                        
+                        # PRIORITY 1: If HP < 50%, go back to Oldale to heal FIRST! (regardless of battle status)
+                        if lead_hp_percent < 50:
+                            if self.step_count % 50 == 0:
+                                logger.warning(f"⚠️ ROUTE 103: HP too low ({lead_hp_percent:.0f}%)! Go to Oldale PokeCenter to heal!")
+                            dynamic_exit = self.get_exit_for_objective(connections, 'oldale')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
                             else:
                                 terrain_goal = 'oldale_exit'
                             terrain_nav_active = True
-                    
-                    elif map_id == 0x020C:  # BIRCH_LAB
-                        # After getting starter, head to exit
-                        if getattr(self, 'has_starter', False) or party_size > 0:
-                            terrain_goal = 'exit'
+                        elif not rival_battled:
+                            # HP is OK, go find rival - left/middle of Route 103, y=3 is correct, x<10
+                            terrain_goal = (7, 3)  # Rival's position on Route 103 (corrected: x<10, y=3)
                             terrain_nav_active = True
                         else:
-                            terrain_goal = 'birch'  # Need to talk to Birch
+                            # rival_battled=True and HP is OK - Return to Oldale after battle
+                            dynamic_exit = self.get_exit_for_objective(connections, 'oldale')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                                if self.step_count % 50 == 0:
+                                    logger.info(f"🎯 R103 POST-BATTLE: Using exit {dynamic_exit} to OLDALE")
+                            else:
+                                terrain_goal = 'oldale_exit'
+                                if self.step_count % 50 == 0:
+                                    logger.info(f"🎯 R103 POST-BATTLE: Using fallback oldale_exit")
                             terrain_nav_active = True
+
+                    
+                    elif map_id == 0x0F:  # ROUTE_102 (west of Oldale, leads to Petalburg)
+                        connections = memory.get('connections', [])
+                        
+                        # Check if we need healing before continuing to Petalburg
+                        # Get lead Pokemon HP from state
+                        lead_hp_percent = 100  # Default to full
+                        try:
+                            party = memory.get('party', [])
+                            if party and len(party) > 0:
+                                lead_mon = party[0]
+                                if lead_mon and lead_mon.get('max_hp', 0) > 0:
+                                    lead_hp_percent = (lead_mon.get('current_hp', 0) / lead_mon.get('max_hp', 1)) * 100
+                        except:
+                            pass
+                        
+                        # If HP low and not close to Petalburg (x > 5), return to Oldale PokeCenter
+                        if lead_hp_percent < 50 and x > 5:
+                            # Return EAST to Oldale for PokeCenter
+                            dynamic_exit = self.get_exit_for_objective(connections, 'oldale')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                                if self.step_count % 50 == 0:
+                                    logger.info(f"🏥 R102: HP low ({lead_hp_percent:.0f}%), return to Oldale PokeCenter")
+                            else:
+                                terrain_goal = 'oldale_exit'  # Fallback: Go east
+                            terrain_nav_active = True
+                        else:
+                            # Route 102 is the path to Petalburg after getting Pokedex
+                            # Go WEST toward Petalburg City
+                            dynamic_exit = self.get_exit_for_objective(connections, 'petalburg')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                                if self.step_count % 100 == 0:
+                                    logger.info(f"🎯 DYNAMIC: Using server exit {dynamic_exit} to PETALBURG")
+                            else:
+                                terrain_goal = 'petalburg_entrance'  # Fallback: Go west
+                            terrain_nav_active = True
+
+                    
+                    elif map_id in [0x104, 0x020C]:  # BIRCH_LAB (multiple possible IDs)
+
+                        connections = memory.get('connections', [])
+                        has_pokedex = memory.get('has_pokedex', False)
+                        
+                        # FIXED LOGIC:
+                        # 1. has_pokedex → EXIT (done with lab)
+                        # 2. rival_battled && !has_pokedex → GO TO BIRCH (get Pokedex)
+                        # 3. !rival_battled → EXIT (need to battle rival first)
+                        
+                        if has_pokedex:
+                            # Already have Pokedex - head to exit
+                            dynamic_exit = None
+                            for conn in connections:
+                                to_loc = (conn.get('to') or '').upper()
+                                from_pos = conn.get('from_pos', [])
+                                if len(from_pos) >= 2:
+                                    if 'LITTLEROOT' in to_loc or 'TOWN' in to_loc:
+                                        dynamic_exit = (int(from_pos[0]), int(from_pos[1]))
+                                        if self.step_count % 100 == 0:
+                                            logger.info(f"🎯 DYNAMIC LAB EXIT: Using server exit {dynamic_exit}")
+                                        break
+                            
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                            else:
+                                terrain_goal = 'exit'  # Fallback
+                            terrain_nav_active = True
+                        elif rival_battled and not has_pokedex:
+                            # CRITICAL: Defeated rival, need Pokedex from Birch!
+                            # Birch is typically at (6, 5) in his lab
+                            terrain_goal = (6, 5)  # Birch's position
+                            terrain_nav_active = True
+                            if self.step_count % 50 == 0:
+                                logger.info(f"🎓 BIRCH LAB: Go to Birch at (6,5) to receive Pokedex!")
+                        else:
+                            # Haven't battled rival yet - exit and go to Route 103
+                            dynamic_exit = None
+                            for conn in connections:
+                                to_loc = (conn.get('to') or '').upper()
+                                from_pos = conn.get('from_pos', [])
+                                if len(from_pos) >= 2:
+                                    if 'LITTLEROOT' in to_loc or 'TOWN' in to_loc:
+                                        dynamic_exit = (int(from_pos[0]), int(from_pos[1]))
+                                        break
+                            
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                            else:
+                                terrain_goal = 'exit'
+                            terrain_nav_active = True
+
+                    
+                    elif map_id == 0x09:  # LITTLEROOT_TOWN (outdoor)
+                        connections = memory.get('connections', [])
+                        has_pokedex = memory.get('has_pokedex', False)
+                        
+                        # Check milestones to determine progress
+                        milestones_data = memory.get('milestones', {})
+                        if isinstance(milestones_data, dict):
+                            completed_milestones = list(milestones_data.keys()) if 'completed' not in milestones_data else milestones_data.get('completed', [])
+                        else:
+                            completed_milestones = []
+                        
+                        visited_route102 = 'ROUTE_102' in str(completed_milestones)
+                        visited_petalburg = 'PETALBURG_CITY' in str(completed_milestones)
+                        
+                        # PRIORITY 1: Visit rival's bedroom FIRST before anything else!
+                        # This is required for the story to progress
+                        rival_bedroom_done = 'RIVAL_BEDROOM' in str(completed_milestones)
+                        if not rival_bedroom_done and not (getattr(self, 'has_starter', False) or party_size > 0):
+                            # MUST visit rival's bedroom before going anywhere else!
+                            # Gender-aware rival house selection:
+                            # Male avatar (Boy): Brendan = player, May = rival -> May's house at (17, 9)
+                            # Female avatar (Girl): May = player, Brendan = rival -> Brendan's house at (4, 9)
+                            player_gender = memory.get('player', {}).get('gender', 'Boy')
+                            if player_gender == 'Girl':
+                                rival_house_x, rival_house_y = 4, 9  # Brendan's house (rival for female)
+                                rival_name = "Brendan"
+                            else:
+                                rival_house_x, rival_house_y = 17, 9  # May's house (rival for male)
+                                rival_name = "May"
+                            terrain_goal = (rival_house_x, rival_house_y)
+                            terrain_nav_active = True
+                            
+                            # Use A* pathfinding for ground truth navigation
+                            if metatile_info:
+                                a_star_result = self.terrain_nav.get_direction(
+                                    map_id=0x09,  # Littleroot Town
+                                    x=x, y=y,
+                                    goal=terrain_goal,
+                                    metatile_info=metatile_info
+                                )
+                                if a_star_result:
+                                    terrain_nav_result = a_star_result
+                                    if self.step_count % 30 == 0:
+                                        logger.info(f"🏠 RIVAL HOUSE A*: ({x},{y}) -> {a_star_result['action']} to {rival_name}'s house")
+                            
+                            if self.step_count % 50 == 0:
+                                logger.info(f"🏠 LITTLEROOT: RIVAL_BEDROOM not done! Go to {rival_name}'s house at ({rival_house_x},{rival_house_y})")
+                        
+                        elif rival_battled and not has_pokedex:
+
+                            # After rival battle, need to go to Birch's Lab for Pokedex
+                            dynamic_exit = self.get_exit_for_objective(connections, 'lab')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                                if self.step_count % 100 == 0:
+                                    logger.info(f"🎯 DYNAMIC: Using server exit {dynamic_exit} to BIRCH'S LAB")
+                            else:
+                                terrain_goal = 'birch_lab'  # Fallback
+                            terrain_nav_active = True
+                        elif has_pokedex:
+                            # Has Pokedex - head to Route 101 to continue to Petalburg
+                            # This is the correct forward path: Littleroot → Route 101 → Oldale → Route 102 → Petalburg
+                            dynamic_exit = self.get_exit_for_objective(connections, 'route101')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                                if self.step_count % 100 == 0:
+                                    logger.info(f"🎯 LITTLEROOT: Go Route 101 → Oldale → Route 102 → Petalburg")
+                            else:
+                                terrain_goal = 'route101_exit'  # Fallback
+                            terrain_nav_active = True
+
+                        elif not (getattr(self, 'has_starter', False) or party_size > 0):
+                            # No starter yet - after rival bedroom, go NORTH to Route 101!
+                            # Birch is in Route 101 tall grass being chased - NOT at the lab!
+                            # Story order: Rival bedroom → Route 101 → Rescue Birch → Get starter
+                            dynamic_exit = self.get_exit_for_objective(connections, 'route101')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                                if self.step_count % 100 == 0:
+                                    logger.info(f"🎯 LITTLEROOT: No starter - go NORTH to Route 101 to find Birch!")
+                            else:
+                                terrain_goal = 'route101_exit'  # Go NORTH, not to lab!
+                            terrain_nav_active = True
+                        else:
+                            # Has starter, go to Route 101
+                            dynamic_exit = self.get_exit_for_objective(connections, 'route101')
+                            if dynamic_exit:
+                                terrain_goal = dynamic_exit
+                            else:
+                                terrain_goal = 'route101_exit'  # Fallback
+                            terrain_nav_active = True
+
+
                     
                     elif map_id in [0x100, 0x101, 0x102, 0x103]:  # Houses (Brendan/May)
                         # Always exit houses after getting starter
+
                         if getattr(self, 'has_starter', False) or party_size > 0:
                             # Check if on 2F - need to target STAIRS, not exit door!
                             # 0x101 = Brendan's house 2F, 0x103 = May's house 2F
-                            if map_id in [0x101, 0x103]:
+                            # ALSO check location string since map_id can be wrong (0x0)
+                            is_on_2f = (map_id in [0x101, 0x103]) or ('2F' in location_upper)
+                            if is_on_2f:
                                 # ON 2F: Use portal connections to find stairs coordinates
                                 connections = memory.get('connections', [])
                                 stairs_coords = None
@@ -1915,12 +4050,232 @@ def main():
                                 
                                 terrain_goal = stairs_coords
                             else:
-                                # ON 1F: Target exit door
-                                terrain_goal = (4, 8)  # House exit door (LEFT-BOTTOM side, visual position)
+                                # ON 1F: Target exit door - use ground truth first!
+                                connections = memory.get('connections', [])
+                                exit_door = None
+                                
+                                for conn in connections:
+                                    to_loc = (conn.get('to') or '').upper()
+                                    from_pos = conn.get('from_pos', [])
+                                    if len(from_pos) >= 2:
+                                        # Look for outdoor connections (Town, Route) - EXCLUDE indoor locations!
+                                        is_outdoor = ('TOWN' in to_loc or 'ROUTE' in to_loc or 'LITTLEROOT' in to_loc)
+                                        is_indoor = ('HOUSE' in to_loc or '2F' in to_loc or '1F' in to_loc or 'BEDROOM' in to_loc)
+                                        if is_outdoor and not is_indoor:
+                                            exit_door = (int(from_pos[0]), int(from_pos[1]))
+                                            if self.step_count % 100 == 0:
+                                                logger.info(f"🎯 DYNAMIC HOUSE EXIT: Using server exit {exit_door} to {to_loc}")
+                                            break
+                                
+                                if exit_door:
+                                    terrain_goal = exit_door
+                                else:
+                                    # Debug: Log available connections to understand why no outdoor exit found
+                                    if self.step_count % 50 == 0:
+                                        logger.warning(f"⚠️ 1F EXIT: No outdoor exit found! Connections: {[c.get('to', '') for c in connections]}")
+                                    terrain_goal = (8, 8)  # Hardcoded fallback (Brendan's house exit)
                             
                             terrain_nav_active = True
+                        else:
+                            # NO POKEMON - either early game or after blackout
+                            # Still need to exit house to visit rival's house or find Birch!
+                            # Player's house 1F: exit door at (8, 8)
+                            # Player's house 2F: stairs at (2, 2)
+                            if map_id in [0x101, 0x103]:  # 2F - go to stairs
+                                terrain_goal = (8, 2)  # Stairs on 2F (leads to 1F)
+                            else:  # 1F - go to door
+                                terrain_goal = (8, 8)  # Exit door (Brendan's house)
+                            terrain_nav_active = True
+                            if self.step_count % 50 == 0:
+                                logger.info(f"🏠 NO POKEMON: Exiting house via {terrain_goal}")
+
+                    # === GENERIC HOUSE FALLBACK (for unknown map IDs like OLDALE TOWN HOUSE1) ===
+                    elif 'HOUSE' in location_upper and not terrain_nav_active:
+                        if party_size > 0 or getattr(self, 'has_starter', False):
+                            # Have Pokemon - should exit the house!
+                            connections = memory.get('connections', [])
+                            exit_door = None
+                            for conn in connections:
+                                to_loc = (conn.get('to') or '').upper()
+                                from_pos = conn.get('from_pos', [])
+                                is_outdoor = ('TOWN' in to_loc or 'ROUTE' in to_loc)
+                                is_indoor = ('HOUSE' in to_loc or '2F' in to_loc or '1F' in to_loc)
+                                if len(from_pos) >= 2 and is_outdoor and not is_indoor:
+                                    exit_door = (int(from_pos[0]), int(from_pos[1]))
+                                    if self.step_count % 100 == 0:
+                                        logger.info(f"🎯 GENERIC HOUSE EXIT: {exit_door} to {to_loc}")
+                                    break
+                            terrain_goal = exit_door if exit_door else (8, 8)  # Fallback exit (Brendan's house)
+                            terrain_nav_active = True
+                            if self.step_count % 100 == 0 and not exit_door:
+                                logger.info(f"🎯 GENERIC HOUSE: Using fallback exit (4,8)")
+                        else:
+                            # NO POKEMON - early game, still need to exit house!
+                            # Use location string to detect 2F since map_id may be wrong
+                            if '2F' in location_upper or 'BEDROOM' in location_upper:
+                                terrain_goal = (2, 2)  # Stairs to 1F
+                            else:
+                                terrain_goal = (8, 8)  # Exit door on 1F (Brendan's house)
+                            terrain_nav_active = True
+                            if self.step_count % 50 == 0:
+                                logger.info(f"🏠 GENERIC HOUSE (no pokemon): Exit via {terrain_goal}")
+
                     
-                    # Get optimal direction from TerrainNavigator 
+
+                    # HOUSE EXIT with SERVER GROUND TRUTH first, gender-aware hardcoded fallback
+                    if 'HOUSE' in location_upper:
+                        connections = memory.get('connections', [])
+                        player_gender = memory.get('player', {}).get('gender', 'Boy')  # Default to Boy
+                        is_player_house = 'BRENDAN' in location_upper if player_gender == 'Boy' else 'MAY' in location_upper
+                        
+                        # Check if CLOCK_SET milestone is done (need to set clock in player's 2F first!)
+                        clock_set_done = 'CLOCK_SET' in str(memory.get('milestones', {}))
+                        
+                        # PRIORITY 0: If in PLAYER's house 1F and clock NOT set, go to STAIRS (2,2) not exit!
+                        if '1F' in location_upper and is_player_house and not clock_set_done:
+                            # Find stairs to 2F from server connections
+                            stairs_from_server = None
+                            for conn in connections:
+                                to_loc = (conn.get('to') or '').upper()
+                                from_pos = conn.get('from_pos', [])
+                                if len(from_pos) >= 2 and '2F' in to_loc:
+                                    stairs_from_server = (int(from_pos[0]), int(from_pos[1]))
+                                    break
+                            terrain_goal = stairs_from_server if stairs_from_server else (2, 2)  # Fallback to (2,2)
+                            terrain_nav_active = True
+                            if self.step_count % 50 == 0:
+                                logger.info(f"🏠 PLAYER HOUSE 1F: Go UPSTAIRS to set clock at {terrain_goal} (gender={player_gender})")
+                        
+                        # PRIORITY 0.5: If in RIVAL's house 1F and RIVAL_BEDROOM NOT done, go UPSTAIRS!
+                        elif '1F' in location_upper and not is_player_house:
+                            # Check RIVAL_BEDROOM milestone  
+                            rival_bedroom_done = 'RIVAL_BEDROOM' in str(memory.get('milestones', {}))
+                            if not rival_bedroom_done:
+                                # In rival's house - need to go upstairs for bedroom milestone!
+                                stairs_from_server = None
+                                for conn in connections:
+                                    to_loc = (conn.get('to') or '').upper()
+                                    from_pos = conn.get('from_pos', [])
+                                    if len(from_pos) >= 2 and '2F' in to_loc:
+                                        stairs_from_server = (int(from_pos[0]), int(from_pos[1]))
+                                        break
+                                terrain_goal = stairs_from_server if stairs_from_server else (2, 2)
+                                terrain_nav_active = True
+                                if self.step_count % 50 == 0:
+                                    logger.info(f"🏠 RIVAL HOUSE 1F: Go UPSTAIRS to bedroom at {terrain_goal} (gender={player_gender})")
+                            else:
+                                # RIVAL_BEDROOM done - exit the house
+                                pass  # Fall through to exit logic below
+                        else:
+                            # ═══════════════════════════════════════════════════
+                            # OVERRIDE: Server returns WRONG coordinates for houses!
+                            # May's House 1F (0x102) and Brendan's House 1F (0x100): 
+                            #   Server says (14,9) but actual exit is at (1,8)
+                            # Use hardcoded CORRECT values for these maps
+                            # ═══════════════════════════════════════════════════
+                            
+                            # Get map_id from memory
+                            current_map_id = memory.get('map_id')
+                            if isinstance(current_map_id, str):
+                                try:
+                                    current_map_id = int(current_map_id, 16) if current_map_id.startswith('0x') else int(current_map_id)
+                                except:
+                                    current_map_id = None
+                            
+                            # OVERRIDE for house maps with known wrong server data
+                            if current_map_id in [0x102, 0x100]:  # May's/Brendan's House 1F
+                                if '1F' in location_upper:
+                                    terrain_goal = (1, 8)  # CORRECT exit door (server wrongly says 14,9)
+                                    terrain_nav_active = True
+                                    if self.step_count % 50 == 0:
+                                        logger.info(f"🏠 HOUSE 1F OVERRIDE: Exit at {terrain_goal} (map_id={hex(current_map_id) if current_map_id else 'None'})")
+                            elif current_map_id in [0x103, 0x101]:  # May's/Brendan's House 2F  
+                                terrain_goal = (1, 2)  # Stairs down at (1,2) per portal connection
+                                terrain_nav_active = True
+                                if self.step_count % 50 == 0:
+                                    logger.info(f"🏠 HOUSE 2F OVERRIDE: Stairs at {terrain_goal} (map_id={hex(current_map_id) if current_map_id else 'None'})")
+                            elif current_map_id == 0x104:  # Birch's Lab - portal says (7,17) but DD shows (6,12)
+                                terrain_goal = (6, 12)  # CORRECT exit door from visual map DD marker
+                                terrain_nav_active = True
+                                if self.step_count % 50 == 0:
+                                    logger.info(f"🔬 LAB OVERRIDE: Exit at {terrain_goal} (map_id={hex(current_map_id) if current_map_id else 'None'})")
+                            else:
+                                # No hardcoded override - use navigation strategy:
+                                # For INDOOR maps: Try visual map DD labels first (more accurate)
+                                # For OUTDOOR maps: Use portal connections
+                                
+                                is_indoor = any(x in location_upper for x in ['1F', '2F', 'HOUSE', 'LAB', 'CENTER', 'MART', 'BEDROOM'])
+                                
+                                exit_found = None
+                                
+                                if is_indoor:
+                                    # PRIORITY 0: Try visual map DD label (indoor exit strategy)
+                                    dd_exit = self.get_indoor_exit_from_visual_map(memory)
+                                    if dd_exit:
+                                        exit_found = dd_exit
+                                        if self.step_count % 50 == 0:
+                                            logger.info(f"📍 VISUAL MAP DD: Exit at {exit_found} (indoor={is_indoor})")
+                                
+                                if not exit_found:
+                                    # PRIORITY 1: Server portal connections
+                                    for conn in connections:
+                                        to_loc = (conn.get('to') or '').upper()
+                                        from_pos = conn.get('from_pos', [])
+                                        if len(from_pos) >= 2:
+                                            # 1F: Look for exit to TOWN or outdoor area
+                                            if '1F' in location_upper and ('TOWN' in to_loc or 'ROUTE' in to_loc or 'LITTLEROOT' in to_loc):
+                                                exit_found = (int(from_pos[0]), int(from_pos[1]))
+                                                if self.step_count % 100 == 0:
+                                                    logger.info(f"🏠 SERVER EXIT: {exit_found} to {to_loc}")
+                                                break
+                                            # 2F/BEDROOM: Look for stairs to 1F
+                                            elif ('2F' in location_upper or 'BEDROOM' in location_upper) and '1F' in to_loc:
+                                                exit_found = (int(from_pos[0]), int(from_pos[1]))
+                                                if self.step_count % 100 == 0:
+                                                    logger.info(f"🏠 SERVER STAIRS: {exit_found} to {to_loc}")
+                                                break
+                                
+                                if exit_found:
+                                    terrain_goal = exit_found
+                                    terrain_nav_active = True
+                                else:
+                                    # PRIORITY 2: Hardcoded fallback for unknown maps
+                                    if '1F' in location_upper:
+                                        terrain_goal = (1, 8)  # Default exit door
+                                        if self.step_count % 50 == 0:
+                                            logger.info(f"🏠 FALLBACK 1F: Exit at {terrain_goal}")
+                                    elif '2F' in location_upper or 'BEDROOM' in location_upper:
+                                        terrain_goal = (2, 2)  # Default stairs
+                                        if self.step_count % 50 == 0:
+                                            logger.info(f"🏠 FALLBACK 2F: Stairs at {terrain_goal}")
+                                    terrain_nav_active = True
+
+                    # ═══════════════════════════════════════════════════════════════════
+                    # 🚨 EMERGENCY FALLBACK: When map data is corrupted but we're indoors
+                    # Uses cached location to detect if we should be in a HOUSE
+                    # ═══════════════════════════════════════════════════════════════════
+                    if not terrain_nav_active and not terrain_goal:
+                        cached_loc = getattr(self, '_last_known_location', '')
+                        cached_upper = (cached_loc or '').upper()
+                        
+                        # If last known location was house/indoor, use DOWN fallback
+                        is_indoor_cached = any(kw in cached_upper for kw in ['HOUSE', '1F', '2F', 'BEDROOM', 'LAB'])
+                        
+                        if is_indoor_cached:
+                            # Determine exit direction based on floor
+                            if '2F' in cached_upper or 'BEDROOM' in cached_upper:
+                                # 2F: Go to stairs (usually DOWN then navigate)
+                                terrain_nav_result = {'action': 'DOWN', 'reason': 'EMERGENCY: Map corrupted on 2F, fallback DOWN'}
+                            else:
+                                # 1F: Go to exit (usually DOWN at bottom of house)
+                                terrain_nav_result = {'action': 'DOWN', 'reason': 'EMERGENCY: Map corrupted on 1F, fallback DOWN'}
+                            
+                            terrain_goal = 'exit'
+                            terrain_nav_active = True
+                            
+                            if self.step_count % 50 == 0:
+                                logger.warning(f"⚠️ EMERGENCY NAV: Using DOWN fallback (cached: {cached_loc})")
+
                     # UNLESS already computed (e.g., for 2F direct calculation)
                     if terrain_nav_active and terrain_goal and terrain_nav_result is None:
                         terrain_nav_result = self.terrain_nav.get_direction(
@@ -1932,6 +4287,7 @@ def main():
                     
                     memory['terrain_nav_active'] = terrain_nav_active
                     memory['terrain_nav_result'] = terrain_nav_result
+                    self.last_terrain_result = terrain_nav_result  # Store for forced action override
                     memory['terrain_goal'] = terrain_goal
                     
                     # ═══════════════════════════════════════════════════════════════════
@@ -1966,9 +4322,43 @@ def main():
                         self.position_history.pop(0)
                         self.action_history.pop(0)
                     
+                    # ═══════════════════════════════════════════════════════════════
+                    # 🔴 CONSECUTIVE A-PRESS STUCK DETECTION
+                    # If pressing A too many times, suggest B to escape menus
+                    # (Fixes: stuck in Pokemon summary screen during battle)
+                    # ═══════════════════════════════════════════════════════════════
+                    consecutive_a_count = 0
+                    for act in reversed(self.action_history):
+                        if act == 'A':
+                            consecutive_a_count += 1
+                        else:
+                            break
+                    
+                    a_stuck = consecutive_a_count >= 5  # 5+ A presses = stuck
+                    b_suggested = a_stuck  # Suggest B when stuck on A
+                    
+                    if a_stuck and self.step_count % 10 == 0:
+                        logger.warning(f"⚠️ A-STUCK: {consecutive_a_count} consecutive A presses! Suggesting B to escape.")
+                    
+                    memory['consecutive_a_count'] = consecutive_a_count
+                    memory['a_stuck'] = a_stuck
+                    memory['b_suggested'] = b_suggested
+                    
                     # Calculate reward
-                    reward = 0.0
+                    reward = 0.0 + stuck_penalty  # Apply stuck penalty (0 if not stuck, -10 to -100 if stuck)
                     info_parts = []
+                    if stuck_penalty < 0:
+                        info_parts.append(f"🔄 STUCK: {stuck_penalty:.0f}")
+                    
+                    # A-STUCK OVERRIDE: Penalize A and reward B when stuck
+                    if a_stuck:
+                        if action_name == 'A':
+                            reward -= 50.0  # Penalize continuing to press A
+                            info_parts.append(f"⚠️ A-STUCK ({consecutive_a_count}x): A -50")
+                        elif action_name == 'B':
+                            reward += 100.0  # Reward pressing B to escape
+                            info_parts.append(f"✅ B to escape A-stuck! +100")
+
                     
                     # DIALOG STATE HANDLING - Reward progressing dialog, small penalty for wrong buttons
                     # Note: PokemonRedExperiments doesn't special-case dialog, treating A/B as normal actions
@@ -1983,12 +4373,97 @@ def main():
                             reward -= 0.1  # Reduced from 0.5 - not too harsh
                     
                     # 🚨 HOUSE STUCK PENALTY - Growing penalty for staying in house too long after getting starter
+                    # Also track if stuck in Littleroot house specifically (for exit rewards)
+                    in_littleroot_house = in_house_now and ('LITTLEROOT' in location_upper or map_id in [0x09, 0x0A, 0x0B, 0x0C])
                     if self.steps_in_house > 20:
                         house_penalty = -2.0 * (self.steps_in_house - 20)  # -2 per extra step
                         house_penalty = max(house_penalty, -200.0)  # Cap at -200
                         reward += house_penalty
                         if self.step_count % 20 == 0:
                             info_parts.append(f"🚨 STUCK IN HOUSE x{self.steps_in_house} {house_penalty:.0f}")
+                    
+                    # 🚪 EXIT-HOUSE REWARD: When in Littleroot house and seeking rival, reward actions toward exit
+                    milestone_status = memory.get('milestones', {})
+                    first_rival_pending = not milestone_status.get('FIRST_RIVAL_BATTLE', False)
+                    if in_littleroot_house and first_rival_pending and party_size > 0:
+                        # Use terrain nav result (ground truth pathfinding to stairs/exit)
+                        terrain_nav_result = memory.get('terrain_nav_result')
+                        
+                        if terrain_nav_result:
+                            # Terrain nav knows the correct direction to exit!
+                            correct_dir = terrain_nav_result.get('action')
+                            if action_name == correct_dir:
+                                exit_reward = 2.0 + (0.1 * min(self.steps_in_house, 20))  # Up to +4.0 if stuck
+                                reward += exit_reward
+                                info_parts.append(f"🚪 EXIT HOUSE: {correct_dir} +{exit_reward:.1f}")
+                            else:
+                                # Wrong direction penalty
+                                reward -= 0.5
+                        else:
+                            # Fallback: On 2F, stairs are at (8,2) so usually need UP; on 1F need DOWN
+                            if '2F' in location_upper or 'BEDROOM' in location_upper:
+                                # 2F: Stairs typically at y=2, so need UP if y > 2
+                                if y > 2 and action_name == 'UP':
+                                    exit_reward = 2.0 + (0.1 * min(self.steps_in_house, 20))
+                                    reward += exit_reward
+                                    info_parts.append(f"🚪 EXIT 2F: UP to stairs +{exit_reward:.1f}")
+                                elif y <= 2 and action_name == 'A':
+                                    # At stairs, press A to use them
+                                    exit_reward = 3.0
+                                    reward += exit_reward
+                                    info_parts.append(f"🚪 USE STAIRS: A +{exit_reward:.1f}")
+                            else:
+                                # 1F: Exit door typically at bottom (y=8)
+                                if action_name == 'DOWN':
+                                    exit_reward = 0.8 + (0.1 * min(self.steps_in_house, 20))
+                                    reward += exit_reward
+                                    info_parts.append(f"🚪 EXIT 1F: DOWN +{exit_reward:.1f}")
+                    
+                    # 🚨 STUCK-IN-HOUSE DETECTOR: Progressive penalty after 50 steps
+                    if in_littleroot_house and first_rival_pending and self.steps_in_house > 50:
+                        stuck_penalty = -0.2 * (self.steps_in_house - 50)  # -0.2 per step after 50
+                        stuck_penalty = max(stuck_penalty, -50.0)  # Cap at -50
+                        reward += stuck_penalty
+                        if self.step_count % 10 == 0:
+                            info_parts.append(f"⚠️ STUCK IN HOUSE {self.steps_in_house} steps {stuck_penalty:.1f}")
+                    
+                    # 🧹 AGGRESSIVE HOUSE MEMORY PRUNING: Remove house entries from k-NN when stuck
+                    if in_littleroot_house and first_rival_pending and self.steps_in_house > 100:
+                        # Prune house-related navigation memories so agent doesn't recall going into houses
+                        if hasattr(self, 'episodic_memory') and hasattr(self.episodic_memory, 'nav_memory'):
+                            house_keywords = ['HOUSE', 'BEDROOM', '1F', '2F', 'MAYS', 'BRENDANS', 'PLAYER']
+                            original_count = len(self.episodic_memory.nav_memory)
+                            # Filter out memories that mention houses
+                            self.episodic_memory.nav_memory = [
+                                mem for mem in self.episodic_memory.nav_memory
+                                if not any(kw in str(mem.get('location', '')).upper() for kw in house_keywords)
+                            ]
+                            pruned_count = original_count - len(self.episodic_memory.nav_memory)
+                            if pruned_count > 0 and self.step_count % 50 == 0:
+                                logger.warning(f"🧹 Pruned {pruned_count} house memories from k-NN (stuck {self.steps_in_house} steps)")
+                                info_parts.append(f"🧹 Pruned {pruned_count} house memories")
+                    
+                    # 🧪 LAB STUCK FALLBACK: If in Birch's Lab but haven't WON rival battle, redirect
+                    in_birch_lab = map_id == 0x104  # PROFESSOR_BIRCHS_LAB
+                    if in_birch_lab and first_rival_pending and party_size > 0:
+                        # Agent is trying to enter lab for Pokedex but hasn't beaten rival yet
+                        if not hasattr(self, 'lab_stuck_counter'):
+                            self.lab_stuck_counter = 0
+                        self.lab_stuck_counter += 1
+                        
+                        if self.lab_stuck_counter > 30:
+                            # Strong penalty for wrong objective - should be at Route 103
+                            lab_penalty = -5.0 - (0.5 * (self.lab_stuck_counter - 30))  # Increasing penalty
+                            lab_penalty = max(lab_penalty, -50.0)  # Cap
+                            reward += lab_penalty
+                            if self.step_count % 10 == 0:
+                                logger.warning(f"⚠️ LAB STUCK: In lab x{self.lab_stuck_counter} steps without winning rival battle! Go to Route 103!")
+                                info_parts.append(f"⚠️ LAB STUCK: Go to Route 103! {lab_penalty:.1f}")
+                    else:
+                        # Reset counter when not in lab
+                        if hasattr(self, 'lab_stuck_counter'):
+                            self.lab_stuck_counter = 0
+
                     
                     # ═══════════════════════════════════════════════════════════════════
                     # ⚡ HEALING INTERRUPT REWARD OVERRIDE ⚡
@@ -2006,6 +4481,12 @@ def main():
                                 if action_name == 'A':
                                     reward += 200.0  # HUGE reward for healing!
                                     info_parts.append("💚 HEALING AT NURSE JOY! +200")
+                                    # THIS IS WHERE RESPAWN IS SET - when talking to Nurse Joy!
+                                    if not getattr(self, 'visited_oldale_pokecenter', False):
+                                        self.visited_oldale_pokecenter = True
+                                        reward += 500.0  # MASSIVE bonus for first time!
+                                        info_parts.append("🏥 RESPAWN SET AT OLDALE POKECENTER! +500")
+                                        logger.info("✅ RESPAWN POINT SET BY TALKING TO NURSE JOY!")
                                 elif action_name == 'UP':
                                     reward += 50.0
                             else:
@@ -2102,10 +4583,11 @@ def main():
                     if route101_ledge_interrupt and ledge_target:
                         target_action = ledge_target['action']
                         
+                        # ★★★ CRITICAL: During ledge escape, this reward MUST override terrain nav! ★★★
                         # STRONG rewards for following waypoint navigation
                         if action_name == target_action:
-                            reward += 200.0  # Massive reward for correct direction!
-                            info_parts.append(f"🧱 WAYPOINT: {target_action} +200")
+                            reward += 300.0  # VERY HIGH reward to override terrain nav!
+                            info_parts.append(f"🧱 WAYPOINT: {target_action} +300")
                         elif action_name == 'A':
                             reward += 5.0  # Neutral for A (might interact)
                         else:
@@ -2116,15 +4598,17 @@ def main():
                             }
                             
                             if action_name == opposite_actions.get(target_action):
-                                # Going exactly opposite direction - very wrong!
-                                reward -= 150.0
+                                # Going exactly opposite direction - VERY WRONG during ledge escape!
+                                # Must be higher than terrain_nav's +200 to actually work!
+                                reward -= 400.0
                                 info_parts.append(f"❌ OPPOSITE! Need {target_action} not {action_name}!")
                             elif action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
                                 # Perpendicular movement - less wrong but still not ideal
-                                reward -= 50.0
+                                reward -= 100.0
                                 info_parts.append(f"⚠️ Wrong direction - need {target_action}")
                             else:
                                 reward -= 20.0  # B button etc
+
                     
                     # ═══════════════════════════════════════════════════════════════════
                     # 🏥 OLDALE POKECENTER NAVIGATION REWARDS
@@ -2152,26 +4636,30 @@ def main():
                     
                     # ═══════════════════════════════════════════════════════════════════
                     # 🗺️ ROUTE 103 RIVAL NAVIGATION REWARDS
-                    # Terrain-based path to find rival for battle
+                    # DISABLED: Now using terrain A* which correctly navigates to rival at (12,3)
+                    # The hardcoded logic assumed rival was to LEFT but rival is actually to RIGHT!
+                    # Terrain A* in terrain_navigator.py handles this correctly.
                     # ═══════════════════════════════════════════════════════════════════
                     
-                    if route103_nav and route103_target:
-                        target_action = route103_target['action']
-                        
-                        if action_name == target_action:
-                            reward += 100.0  # Good reward for following terrain guidance
-                            info_parts.append(f"🗺️ R103 NAV: {target_action} +100")
-                        elif action_name == 'A':
-                            reward += 20.0  # Might be talking to rival!
-                            info_parts.append("🗺️ A pressed - initiating battle?")
-                        else:
-                            opposite_actions = {'UP': 'DOWN', 'DOWN': 'UP', 'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}
-                            if action_name == opposite_actions.get(target_action):
-                                reward -= 80.0
-                                info_parts.append(f"❌ Wrong direction on R103! Need {target_action}")
-                            elif action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
-                                reward -= 20.0
-                                info_parts.append(f"⚠️ Off-path on R103 - need {target_action}")
+                    # DISABLED - route103_target gave +200 for LEFT but rival is at (12,3) to RIGHT!
+                    # if route103_nav and route103_target:
+                    #     target_action = route103_target['action']
+                    #     
+                    #     if action_name == target_action:
+                    #         reward += 200.0  # STRONG reward for following terrain guidance (match Route 101)
+                    #         info_parts.append(f"🗺️ R103 WAYPOINT: {target_action} +200")
+                    #     elif action_name == 'A':
+                    #         reward += 50.0  # Might be talking to rival!
+                    #         info_parts.append("🗺️ A pressed - initiating battle?")
+                    #     else:
+                    #         opposite_actions = {'UP': 'DOWN', 'DOWN': 'UP', 'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}
+                    #         if action_name == opposite_actions.get(target_action):
+                    #             reward -= 150.0  # STRONG penalty for opposite (match Route 101)
+                    #             info_parts.append(f"❌ OPPOSITE on R103! Need {target_action}")
+                    #         elif action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                    #             reward -= 50.0
+                    #             info_parts.append(f"⚠️ Off-path on R103 - need {target_action}")
+
                     
                     # ═══════════════════════════════════════════════════════════════════
                     # 💊 NURSE JOY NAVIGATION REWARDS
@@ -2204,14 +4692,64 @@ def main():
                     # ═══════════════════════════════════════════════════════════════════
                     
                     if in_pokecenter_2f:
-                        # Heavy penalty for wasting time on 2F
-                        reward -= 100.0
-                        info_parts.append("🚫 2F PENALTY: -100 (trading floor, useless!)")
+                        # Track steps spent on 2F for increasing penalty
+                        if not hasattr(self, 'steps_on_2f'):
+                            self.steps_on_2f = 0
+                        self.steps_on_2f += 1
+                        
+                        # HEAVY penalty for wasting time on 2F - increases with time!
+                        base_penalty = -300.0
+                        time_penalty = -10.0 * min(self.steps_on_2f, 50)  # Up to -500 extra
+                        total_2f_penalty = base_penalty + time_penalty
+                        reward += total_2f_penalty
+                        info_parts.append(f"🚫 2F PENALTY: {total_2f_penalty:.0f} (step {self.steps_on_2f})")
                         
                         # Reward for going LEFT toward escalator (exit)
                         if action_name == 'LEFT':
-                            reward += 200.0
-                            info_parts.append("🪜 Going LEFT to exit 2F! +200")
+                            reward += 500.0  # Increased from 200
+                            info_parts.append("🪜 Going LEFT to exit 2F! +500")
+                        elif action_name == 'DOWN':
+                            # DOWN is also needed to reach escalator at y=6
+                            reward += 300.0
+                            info_parts.append("🪜 Going DOWN toward escalator! +300")
+                        elif action_name == 'A':
+                            # HEAVY PENALTY for pressing A on 2F - trading/PC is useless!
+                            # Nothing to trade, no Pokemon in PC, just wasting time
+                            reward -= 500.0
+                            info_parts.append("🚫 A on 2F = WASTE! -500 (no trading/PC needed)")
+                        
+                        # FORCED ACTION OVERRIDE when stuck on 2F for too long!
+                        # If steps_on_2f > 50, massively boost LEFT/DOWN and penalize UP
+                        if self.steps_on_2f > 50:
+                            if action_name == 'LEFT':
+                                reward += 1000.0  # MASSIVE override to force LEFT toward escalator
+                                info_parts.append("🚨 2F FORCE LEFT +1000!")
+                            elif action_name == 'DOWN':
+                                reward += 1000.0  # Also good for escalator
+                                info_parts.append("🚨 2F FORCE DOWN +1000!")
+                            elif action_name == 'UP':
+                                reward -= 500.0  # VERY strong penalty for UP on 2F
+                                info_parts.append("🚨 2F UP BLOCK -500!")
+                            elif action_name == 'RIGHT':
+                                reward -= 300.0  # Penalty for going further right (away from escalator)
+                                
+                        # Track position to detect complete stuckness  
+                        if not hasattr(self, 'last_2f_pos'):
+                            self.last_2f_pos = (x, y)
+                        if (x, y) != self.last_2f_pos:
+                            # Position changed - reward movement!
+                            reward += 100.0
+                            info_parts.append("✓ 2F movement +100")
+                        self.last_2f_pos = (x, y)
+                            
+                    else:
+                        # Reset 2F counter when not on 2F
+                        if hasattr(self, 'steps_on_2f'):
+                            self.steps_on_2f = 0
+                        if hasattr(self, 'last_2f_pos'):
+                            self.last_2f_pos = None
+
+
                     
                     # ═══════════════════════════════════════════════════════════════════
                     # 🧭 UNIFIED TERRAIN NAVIGATOR REWARDS
@@ -2320,6 +4858,19 @@ def main():
                     
                     # New map discovery - BIG REWARDS for entering buildings!
                     if map_id != self.last_map_id and self.last_map_id is not None:
+                        # 🆕 MAP TRANSITION RESET: Fix SLAM/A* desync
+                        # Reset stuck counters when map changes
+                        self.stuck_persistence_counter = 0
+                        self.stuck_direction_cycle = 0
+                        if hasattr(self, 'global_action_counter'):
+                            self.global_action_counter = {}
+                        if hasattr(self, 'stuck_position_history'):
+                            self.stuck_position_history.clear()
+                        # Clear terrain cache to force A* recompute on new map
+                        if hasattr(self, 'terrain_nav'):
+                            self.terrain_nav.clear_cache()
+                        logger.info(f"🗺️ MAP TRANSITION: Reset stuck counters & terrain cache")
+                        
                         # Track map transition pattern to detect lab/town loops
                         if not hasattr(self, 'map_transition_history'):
                             self.map_transition_history = []
@@ -2374,16 +4925,28 @@ def main():
                         # Visiting saves respawn here instead of Littleroot on blackout!
                         in_oldale_pokecenter = (map_id == 0x200) or (in_pokecenter and 'OLDALE' in location_upper)
                         
+                        # Debug logging to trace why flag isn't being set
+                        if self.step_count % 50 == 0 and ('POKECENTER' in location_upper or 'POKEMON CENTER' in location_upper or map_id == 0x200):
+                            logger.info(f"🏥 PC DEBUG: map_id={hex(map_id)}, in_pokecenter={in_pokecenter}, location={location_upper[:40]}, in_oldale_pc={in_oldale_pokecenter}")
+                        
                         if in_oldale_pokecenter:
-                            if not hasattr(self, 'visited_oldale_pokecenter'):
-                                reward += 500.0  # MASSIVE bonus - this saves so much time on resets!
-                                info_parts.append("🏥 OLDALE POKECENTER! RESPAWN SET! +500")
-                                self.visited_oldale_pokecenter = True
-                                logger.info("✅ RESPAWN POINT SET AT OLDALE POKECENTER!")
+                            if not getattr(self, 'visited_oldale_pokecenter', False):
+                                # Not yet talked to Nurse Joy - give small bonus for entering
+                                reward += 50.0
+                                info_parts.append("🏥 ENTERED PC - go UP to Nurse Joy! +50")
+                                # SET FLAG FOR NEXT STEP: Force UP to Nurse Joy!
+                                self.force_nurse_next = True
+                                self.force_nurse_y = y  # Store current y for UP vs A decision
                             else:
-                                # RE-ENTRY PENALTY - already visited, stop coming back!
-                                reward -= 200.0
-                                info_parts.append("🚫 PC RE-ENTRY! Already visited! -200")
+                                # Already visited AND healed - but check HP first!
+                                # If HP is low, agent SHOULD re-enter to heal
+                                hp_needs_heal = getattr(self, 'cached_hp_ratio', 0.0) < 0.5  # Default 0.0 = assume low HP
+                                if hp_needs_heal:
+                                    reward += 50.0  # Allow healing!
+                                    info_parts.append("💉 PC RE-ENTRY for HEALING (HP low)! +50")
+                                else:
+                                    reward -= 200.0
+                                    info_parts.append("🚫 PC RE-ENTRY! Already healed! -200")
                     
                     # DIRECTIONAL EXPLORATION BONUS - encourage moving UP/NORTH
                     # In LITTLEROOT_TOWN (0x0101), Route 101 is at the TOP
@@ -2430,15 +4993,18 @@ def main():
                         party_species = progress_ctx.get('party_species', [])
                         party_levels = progress_ctx.get('party_levels', [])
                         
-                        # Build party_state for directive manager
-                        # Format: [{'species': 'TORCHIC', 'level': 11, 'hp': 1, 'max_hp': 1}, ...]
+                        # Build party_state for directive manager with ACTUAL HP!
+                        # Get actual party data from player.party (NOT progress_ctx.party which is None!)
+                        actual_party = state.get('player', {}).get('party', []) or []
                         party_state = []
                         for i in range(party_size):
+                            # Use actual HP from party data if available
+                            actual_mon = actual_party[i] if i < len(actual_party) and actual_party[i] else {}
                             pokemon = {
                                 'species': party_species[i] if i < len(party_species) else 'UNKNOWN',
                                 'level': party_levels[i] if i < len(party_levels) else 1,
-                                'hp': 1,  # Assume alive unless we get HP data
-                                'max_hp': 1
+                                'hp': actual_mon.get('current_hp', actual_mon.get('hp', 1)),
+                                'max_hp': actual_mon.get('max_hp', 1) or 1
                             }
                             party_state.append(pokemon)
                         
@@ -2451,27 +5017,41 @@ def main():
                                 # Format: {"milestones": [{"name": "X", "completed": true}, ...]}
                                 completed_names = [m.get('name') for m in m_data if isinstance(m, dict) and m.get('completed')]
                             elif isinstance(m_data, dict):
-                                # Format: {"milestones": {"X": {"completed": true}, ...}}
+                                # Format: {\"milestones\": {\"X\": {\"completed\": true}, ...}}
                                 completed_names = [k for k, v in m_data.items() if isinstance(v, dict) and v.get('completed')]
+                        
+                        # SYNC: Add OLDALE_POKECENTER to completed_names when internal flag is set
+                        # This syncs train script's visited_oldale_pokecenter flag with directive manager's milestone check
+                        if getattr(self, 'visited_oldale_pokecenter', False) and 'OLDALE_POKECENTER' not in completed_names:
+                            completed_names.append('OLDALE_POKECENTER')
                         
                         location_name = memory.get('location', 'unknown')
                         location_name_upper = (location_name or 'unknown').upper()
                         has_pokedex = memory.get('has_pokedex', False)
                         
                         # Call update_directive with list of completed milestone names AND pokedex flag
+                        # CRITICAL: Pass rival_battle_won - use the OVERRIDDEN rival_battled value
+                        # which has already been checked against pokedex_seen == 0
+                        rival_battle_won = rival_battled  # Uses the already-overridden value
                         directive_info = self.directive_manager.update_directive(
                             party_state,
                             completed_names,
                             location_name,
                             self.step_count,
-                            has_pokedex=has_pokedex
+                            has_pokedex=has_pokedex,
+                            rival_battle_won=rival_battle_won
                         )
+
+
                         
                         if directive_info:
                             self.last_directive = directive_info
                             # The 'reason' field contains the specific navigational instruction
                             target = directive_info.get('reason', '')
                             priority = 10  # Implicit high priority for these directives
+                            
+                            # Cache directive target for UNIVERSAL HEALING OVERRIDE in process_action()
+                            self.cached_directive_target = target
                             
                             # Log directive periodically
                             if self.step_count % 50 == 0:
@@ -2483,10 +5063,10 @@ def main():
                             DOOR_COORDS = {
                                 # HOUSE INTERIORS (for 2F→1F→exit)
                                 'player_house_2f': {
-                                    'stairs': (8, 1),       # Go down at y=1 to reach stairs
+                                    'stairs': (8, 2),       # Brendan's house 2F - stairs
                                 },
                                 'player_house_1f': {
-                                    'door': (3, 8),         # Exit door (LEFT-BOTTOM side, visual position)
+                                    'door': (8, 8),         # Brendan's house 1F - exit door
                                     'mom': (5, 5),          # Mom for healing
                                 },
                                 'rival_house_2f': {
@@ -2495,12 +5075,17 @@ def main():
                                 'rival_house_1f': {
                                     'door': (3, 8),         # Exit door (LEFT-BOTTOM side, visual position)
                                 },
-                                # LITTLEROOT TOWN (use server ground truth when available!)
+                                # LITTLEROOT TOWN (PORTAL GROUND TRUTH!)
+                                # For Girl: May's(14,9)=player, Brendan's(8,8)=rival
+                                # For Boy: Brendan's(8,8)=player, May's(14,9)=rival
                                 'littleroot': {
-                                    'player_house': (8, 8),
-                                    'rival_house': (17, 9),  # Enter from below (bottom)
-                                    'lab': (12, 14),
-                                    'route_101_north': (11, 0)  # GROUND TRUTH from server! Portal to Route 101
+                                    # Use server portal connections for gender-aware detection!
+                                    'brendan_house': (8, 8),   # Portal ground truth
+                                    'may_house': (14, 9),      # Portal ground truth
+                                    'player_house': (8, 8),    # Fallback (Boy default)
+                                    'rival_house': (8, 8),     # WRONG - need gender check! Use portal!
+                                    'lab': (7, 17),            # Portal ground truth
+                                    'route_101_north': (11, 0) # GROUND TRUTH from server!
                                 },
                                 # OLDALE TOWN
                                 'oldale': {
@@ -2695,14 +5280,32 @@ def main():
                                     if dynamic_exit:
                                         target_x, target_y = dynamic_exit
                                         best_dir = get_best_direction(current_x, current_y, target_x, target_y)
+                                        # Check if terrain A* conflicts with simple best_dir
+                                        terrain_result = memory.get('terrain_nav_result')
+                                        terrain_conflicts = terrain_result and terrain_result.get('action') != best_dir
+                                        
                                         if best_dir and action_name == best_dir:
-                                            directive_reward = 80.0  # Strong guidance on Route 101
+                                            if terrain_conflicts:
+                                                # Terrain knows about obstacles/ledges - reduced reward
+                                                directive_reward = 20.0
+                                            else:
+                                                directive_reward = 80.0  # Strong guidance on Route 101
                                             if self.step_count % 100 == 0:
                                                 logger.info(f"🌐 PORTAL: ROUTE_101 → OLDALE at ({target_x},{target_y}) = {best_dir}")
                                         elif action_name == 'UP':
-                                            directive_reward = 60.0  # General north is good
+                                            # DEFER TO TERRAIN: If terrain says something different, respect it!
+                                            if terrain_conflicts:
+                                                # Terrain knows about obstacles/ledges, don't reward UP
+                                                directive_reward = 0.0  # Let terrain handle it
+                                            else:
+                                                directive_reward = 60.0  # General north is good
                                     elif action_name == 'UP':
-                                        directive_reward = 40.0  # Fallback: go north
+                                        # DEFER TO TERRAIN: If terrain says something different, respect it!
+                                        terrain_result = memory.get('terrain_nav_result')
+                                        if terrain_result and terrain_result.get('action') != 'UP':
+                                            directive_reward = 0.0  # Let terrain handle it
+                                        else:
+                                            directive_reward = 40.0  # Fallback: go north
                                 
                                 # Oldale → Route 103 pathfinding
                                 elif 'OLDALE' in location_upper:
@@ -2730,9 +5333,11 @@ def main():
                                         elif action_name == 'UP':
                                             directive_reward = 40.0
                                 else:
-                                    # Generic GO_NORTH fallback
-                                    if action_name == 'UP':
-                                        directive_reward = 20.0
+                                    # Generic GO_NORTH fallback - BUT NOT INSIDE BUILDINGS!
+                                    # Indoor navigation is handled by terrain_nav with ground truth A*
+                                    if 'HOUSE' not in location_upper and 'LAB' not in location_upper and 'POKECENTER' not in location_upper:
+                                        if action_name == 'UP':
+                                            directive_reward = 20.0
                             
                             # GO_SOUTH: Return journey after beating rival
                             elif 'GO_SOUTH' in target:
@@ -2854,7 +5459,7 @@ def main():
                                         elif action_name == 'A':
                                             directive_reward = 10.0  # Press A to talk to rival
                                         elif action_name in ['DOWN', 'LEFT']:
-                                            directive_reward = 3.0  # Some exploration OK
+                                            directive_reward = 3.0  # Some exploration OK for snake path around ledges
                                 else:
                                     # Not on Route 103 yet
                                     if action_name in ['UP', 'RIGHT']:
@@ -2921,45 +5526,48 @@ def main():
                                         directive_reward = -50.0
                                         
                                 elif '1F' in location_upper:
-                                    # ===== 1F: Find door using hardcoded coordinates =====
-                                    # NOTE: Portal data from server shows wrong coordinates [14,9] for house exits
-                                    # Visual inspection shows door is at LEFT-BOTTOM (3,8), not right side
-                                    # Using ONLY hardcoded coordinates until server portal data is fixed
-                                    door_exit = (3, 8)  # House door (LEFT-BOTTOM side, visual position)
-                                    source = "hardcoded"
+                                    # ===== 1F: PRIORITY 1 - Real-time portal connections (ground truth!) =====
+                                    door_exit = None
+                                    source = "unknown"
                                     
-                                    # DISABLED: Portal connections (server provides incorrect [14,9])
-                                    # if connections:
-                                    #     for conn in connections:
-                                    #         to_loc = conn.get('to', '').upper()
-                                    #         if 'TOWN' in to_loc or 'LITTLEROOT' in to_loc:
-                                    #             from_pos = conn.get('from_pos', [])
-                                    #             if len(from_pos) >= 2:
-                                    #                 door_exit = (int(from_pos[0]), int(from_pos[1]))
-                                    #                 source = "portal"
-                                    #                 break
+                                    # Try portal connections first (server ground truth)
+                                    if connections:
+                                        for conn in connections:
+                                            to_loc = conn.get('to', '').upper()
+                                            # Look for outdoor connections (TOWN, LITTLEROOT, ROUTE)
+                                            # CRITICAL: Exclude INDOOR destinations (2F, 1F, HOUSE, BEDROOM)
+                                            is_outdoor = 'TOWN' in to_loc or 'LITTLEROOT' in to_loc or 'ROUTE' in to_loc
+                                            is_indoor = '2F' in to_loc or '1F' in to_loc or 'HOUSE' in to_loc or 'BEDROOM' in to_loc
+                                            if is_outdoor and not is_indoor:
+                                                from_pos = conn.get('from_pos', [])
+                                                if len(from_pos) >= 2:
+                                                    door_exit = (int(from_pos[0]), int(from_pos[1]))
+                                                    source = "portal"
+                                                    if self.step_count % 100 == 0:
+                                                        logger.info(f"🌐 1F EXIT: Using portal ground truth → {to_loc} at {door_exit}")
+                                                    break
                                     
-                                    # DISABLED: Terrain data (no warp tiles in server response)
-                                    # if not door_exit and terrain:
-                                    #     for tile in terrain:
-                                    #         behavior = (tile.get('behavior', '') or '').upper()
-                                    #         if 'WARP' in behavior or 'DOOR' in behavior:
-                                    #             tx, ty = tile.get('x'), tile.get('y')
-                                    #             if tx is not None and ty is not None:
-                                    #                 door_exit = (int(tx), int(ty))
-                                    #                 source = "terrain"
-                                    #                 break
-                                    
-                                    # SLAM pathfinding to door
-                                    target_x, target_y = door_exit
-                                    best_dir = get_best_direction(current_x, current_y, target_x, target_y)
-                                    
-                                    if best_dir and action_name == best_dir:
-                                        directive_reward = 100.0
-                                        if self.step_count % 50 == 0:
-                                            logger.info(f"🏠 1F EXIT: ({current_x},{current_y}) → door({target_x},{target_y}) = {best_dir} (+100) [{source}]")
-                                    elif action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
-                                        directive_reward = -30.0
+                                    # FALLBACK: If no portal, use DOWN direction (exits at bottom)
+                                    if door_exit:
+                                        target_x, target_y = door_exit
+                                        best_dir = get_best_direction(current_x, current_y, target_x, target_y)
+                                        
+                                        if best_dir and action_name == best_dir:
+                                            directive_reward = 100.0
+                                            if self.step_count % 50 == 0:
+                                                logger.info(f"🏠 1F EXIT: ({current_x},{current_y}) → door({target_x},{target_y}) = {best_dir} (+100) [{source}]")
+                                        elif action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                                            directive_reward = -30.0
+                                    else:
+                                        # No portal data - use DOWN as generic direction (exits at bottom)
+                                        if action_name == 'DOWN':
+                                            directive_reward = 80.0  # Strong reward for DOWN
+                                            if self.step_count % 50 == 0:
+                                                logger.info(f"🏠 1F EXIT: No portal - using DOWN to find exit")
+                                        elif action_name in ['LEFT', 'RIGHT']:
+                                            directive_reward = 10.0  # Allow lateral exploration
+                                        elif action_name == 'UP':
+                                            directive_reward = -50.0  # Penalty for going away from exit
                                 else:
                                     # Generic - encourage DOWN
                                     if action_name == 'DOWN':
@@ -2971,25 +5579,60 @@ def main():
                             
                             # POST-HEAL: Exit house immediately after healing
                             elif 'EXIT_HOUSE_AFTER_HEAL' in target or 'AFTER_HEAL' in target:
-                                # Same as EXIT_HOUSE but with logging
+                                # Use portal connections (ground truth!) or DOWN fallback
                                 current_x = memory.get('x', 0)
                                 current_y = memory.get('y', 0)
                                 location_upper = (memory.get('location', '') or '').upper()
+                                connections = memory.get('connections', [])
                                 
                                 if '2F' in location_upper or 'BEDROOM' in location_upper:
-                                    target_x, target_y = 8, 1  # Stairs
+                                    # 2F: Find stairs via portal or use DOWN
+                                    stairs_exit = None
+                                    for conn in connections:
+                                        to_loc = conn.get('to', '').upper()
+                                        if '1F' in to_loc:
+                                            from_pos = conn.get('from_pos', [])
+                                            if len(from_pos) >= 2:
+                                                stairs_exit = (int(from_pos[0]), int(from_pos[1]))
+                                                break
+                                    if stairs_exit:
+                                        target_x, target_y = stairs_exit
+                                    else:
+                                        target_x, target_y = current_x, current_y + 1  # DOWN
                                 else:
-                                    target_x, target_y = 3, 8  # Door (LEFT-BOTTOM side, visual position)
+                                    # 1F: Find exit via portal or use DOWN
+                                    door_exit = None
+                                    for conn in connections:
+                                        to_loc = conn.get('to', '').upper()
+                                        if 'TOWN' in to_loc or 'LITTLEROOT' in to_loc or 'ROUTE' in to_loc:
+                                            from_pos = conn.get('from_pos', [])
+                                            if len(from_pos) >= 2:
+                                                door_exit = (int(from_pos[0]), int(from_pos[1]))
+                                                break
+                                    if door_exit:
+                                        target_x, target_y = door_exit
+                                    else:
+                                        # No portal - go DOWN (exits at bottom)
+                                        if action_name == 'DOWN':
+                                            directive_reward = 80.0
+                                            if self.step_count % 50 == 0:
+                                                logger.info(f"🏠 POST-HEAL: No portal - using DOWN")
+                                        elif action_name == 'UP':
+                                            directive_reward = -50.0
+                                        else:
+                                            directive_reward = 5.0  # Allow lateral
+                                        target_x, target_y = None, None  # Skip pathfinding
                                 
-                                best_dir = get_best_direction(current_x, current_y, target_x, target_y)
-                                if best_dir and action_name == best_dir:
-                                    directive_reward = 100.0  # HIGH priority to exit!
-                                    if self.step_count % 50 == 0:
-                                        logger.info(f"🏠 POST-HEAL EXIT: ({current_x},{current_y}) → ({target_x},{target_y}) = {best_dir}")
-                                elif action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
-                                    directive_reward = -20.0  # Strong penalty for wrong dir
-                                elif action_name == 'NOOP':
-                                    directive_reward = -30.0  # Very strong penalty
+                                if target_x is not None:
+                                    best_dir = get_best_direction(current_x, current_y, target_x, target_y)
+                                    if best_dir and action_name == best_dir:
+                                        directive_reward = 100.0  # HIGH priority to exit!
+                                        if self.step_count % 50 == 0:
+                                            logger.info(f"🏠 POST-HEAL EXIT: ({current_x},{current_y}) → ({target_x},{target_y}) = {best_dir}")
+                                    elif action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                                        directive_reward = -20.0  # Strong penalty for wrong dir
+                                    elif action_name == 'NOOP':
+                                        directive_reward = -30.0  # Very strong penalty
                             
                             # ROUTE 101 OBSTACLE PATHFINDING: Ledges + Trees
                             # NOTE: This is DISABLED when route101_ledge_interrupt is active
@@ -3231,6 +5874,16 @@ def main():
                                 max_action_rep = max(action_counts.values()) if action_counts else 0
                                 action_stuck = max_action_rep > 7  # Same action 7/10 times
                                 
+                                # 🛑 DIRECTION-SPAM PENALTY: If same direction used 7+ times
+                                if action_stuck:
+                                    most_spammed = max(action_counts, key=action_counts.get) if action_counts else None
+                                    if most_spammed in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
+                                        direction_spam_penalty = -50.0
+                                        reward += direction_spam_penalty
+                                        if self.step_count % 50 == 0:
+                                            logger.warning(f"🛑 DIRECTION SPAM: {most_spammed} × {max_action_rep}/10 → -50")
+                                            info_parts.append(f"🛑 {most_spammed}-SPAM -50")
+                                
                                 # 3. SNN temporal pattern (low variance = stuck)
                                 if len(self.snn_spike_variance_history) >= 10:
                                     recent_snn_var = self.snn_spike_variance_history[-10:]
@@ -3245,6 +5898,23 @@ def main():
                                 
                                 if is_stuck and self.step_count % 100 == 0:
                                     logger.info(f"🔴 STUCK DETECTED: Pos={position_stuck}, Act={action_stuck}, SNN={snn_stuck} (var={avg_snn_variance if 'avg_snn_variance' in locals() else 0:.4f})")
+                                
+                                # 🆕 AGGRESSIVE ACTION DIVERSITY (30+ steps stuck at same position)
+                                # If stuck too long, heavily penalize the most-used action to force diversity
+                                if max_position_rep >= 30:
+                                    most_used_action = max(action_counts, key=action_counts.get) if action_counts else None
+                                    if most_used_action and action_name == most_used_action:
+                                        diversity_penalty = -200.0
+                                        reward += diversity_penalty
+                                        logger.warning(f"🔄 FORCED DIVERSITY: Stuck {max_position_rep} steps! {most_used_action} -200 to try different action")
+                                        info_parts.append(f"🔄 STUCK {max_position_rep}: {most_used_action} -200")
+                                    # Also boost the least-used action
+                                    elif action_counts:
+                                        least_used = min(action_counts, key=action_counts.get)
+                                        if action_name == least_used:
+                                            diversity_bonus = 100.0
+                                            reward += diversity_bonus
+                                            logger.info(f"✅ DIVERSITY BONUS: Trying underused action {least_used} +100")
                                 
                                 # CONDITIONAL: Use ground truth pathfinding ONLY if stuck + high priority
                                 directive_priority = directive_info.get('target_level', 0) if 'directive_info' in locals() else 10
@@ -3274,9 +5944,16 @@ def main():
                                         if self.step_count % 100 == 0:
                                             logger.info(f"🏠 Using PORTAL rival_house coords: ({rival_x},{rival_y})")
                                     else:
-                                        rival_x, rival_y = DOOR_COORDS['littleroot']['rival_house']  # Fallback: (17, 9)
+                                        # Gender-aware fallback using PORTAL GROUND TRUTH coords
+                                        player_gender = memory.get('player', {}).get('gender', 'Boy')
+                                        if player_gender == 'Girl':
+                                            # Girl's rival is Brendan's house (8, 8)
+                                            rival_x, rival_y = DOOR_COORDS['littleroot']['brendan_house']
+                                        else:
+                                            # Boy's rival is May's house (14, 9)
+                                            rival_x, rival_y = DOOR_COORDS['littleroot']['may_house']
                                         if self.step_count % 100 == 0:
-                                            logger.info(f"🏠 Using FALLBACK rival_house coords: ({rival_x},{rival_y})")
+                                            logger.info(f"🏠 Using GENDER-AWARE rival_house coords: ({rival_x},{rival_y}) [{player_gender}]")
                                     
                                     # Check if at the door position (17, 9)
                                     at_door = (current_x == rival_x and current_y == rival_y)
@@ -3292,42 +5969,98 @@ def main():
                                         # 2. Then move UP to y=9
                                         
                                         if current_x != rival_x:
-                                            # First priority: get to x=17 (door's column)
+                                            # Need to move horizontally toward rival house
                                             if current_x < rival_x and action_name == 'RIGHT':
                                                 directive_reward = 200.0
                                                 logger.info(f"🏠 RIVAL HOUSE: x{current_x}→{rival_x}, going RIGHT (+200)")
                                             elif current_x > rival_x and action_name == 'LEFT':
                                                 directive_reward = 200.0
                                                 logger.info(f"🏠 RIVAL HOUSE: x{current_x}→{rival_x}, going LEFT (+200)")
-                                            elif action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
-                                                directive_reward = -50.0  # Wrong direction
-                                        elif current_y > rival_y:
-                                            # At correct x=17, but south of door (y > 9)
-                                            if action_name == 'UP':
-                                                directive_reward = 200.0
-                                                logger.info(f"🏠 RIVAL HOUSE: y{current_y}→{rival_y}, going UP (+200)")
-                                            elif action_name in ['DOWN', 'LEFT', 'RIGHT']:
-                                                directive_reward = -50.0
-                                        elif current_y < rival_y:
-                                            # At correct x=17, but north of door (shouldn't happen, but handle it)
-                                            if action_name == 'DOWN':
+                                        
+                                        if current_y != rival_y:
+                                            # ALSO need to move vertically! (not elif - check BOTH!)
+                                            if current_y < rival_y and action_name == 'DOWN':
+                                                # Agent NORTH of door (y < 9), go DOWN!
                                                 directive_reward = 200.0
                                                 logger.info(f"🏠 RIVAL HOUSE: y{current_y}→{rival_y}, going DOWN (+200)")
-                                            elif action_name in ['UP', 'LEFT', 'RIGHT']:
+                                            elif current_y > rival_y and action_name == 'UP':
+                                                # Agent SOUTH of door (y > 9), go UP
+                                                directive_reward = 200.0
+                                                logger.info(f"🏠 RIVAL HOUSE: y{current_y}→{rival_y}, going UP (+200)")
+                                        
+                                        # Penalize wrong direction only if we didn't already reward
+                                        if directive_reward == 0.0:
+                                            # Check if action is moving AWAY from goal
+                                            dx = rival_x - current_x
+                                            dy = rival_y - current_y
+                                            if (action_name == 'LEFT' and dx > 0) or \
+                                               (action_name == 'RIGHT' and dx < 0) or \
+                                               (action_name == 'UP' and dy > 0) or \
+                                               (action_name == 'DOWN' and dy < 0):
                                                 directive_reward = -50.0
+
                                     else:
                                         # At door but wrong action
                                         if action_name in ['DOWN', 'LEFT', 'RIGHT']:
                                             directive_reward = -50.0
                             
-                            # INSIDE RIVAL HOUSE: Go upstairs to bedroom
-                            elif 'GO_UPSTAIRS' in target and 'RIVAL' in target:
-                                # In rival's house 1F - go UP to stairs, then UP again
-                                if action_name == 'UP':
-                                    directive_reward = 100.0  # Strong reward to go upstairs
-                                    logger.info(f"⬆️ GOING UPSTAIRS TO RIVAL BEDROOM (+100)")
-                                elif action_name in ['DOWN', 'LEFT', 'RIGHT']:
-                                    directive_reward = -30.0  # Stronger penalty for wrong direction
+                            # INSIDE HOUSE: Go upstairs - gender-aware for player vs rival
+                            elif 'GO_UPSTAIRS' in target:
+                                # Determine if in PLAYER's house or RIVAL's house
+                                current_loc = memory.get('location', '').upper() if memory else ''
+                                player_gender = memory.get('player', {}).get('gender', 'Boy') if memory else 'Boy'
+                                
+                                # Gender-aware house detection:
+                                # Male (Boy): Brendan's = player's, May's = rival's
+                                # Female (Girl): May's = player's, Brendan's = rival's
+                                in_player_house = ('BRENDAN' in current_loc and player_gender == 'Boy') or \
+                                                  ('MAY' in current_loc and player_gender == 'Girl')
+                                in_rival_house = ('MAY' in current_loc and player_gender == 'Boy') or \
+                                                 ('BRENDAN' in current_loc and player_gender == 'Girl')
+                                
+                                # Check milestones to determine if we should go upstairs or exit
+                                clock_set_done = 'CLOCK_SET' in str(memory.get('milestones', {}))
+                                rival_bedroom_done = 'RIVAL_BEDROOM' in str(memory.get('milestones', {}))
+                                
+                                if in_player_house:
+                                    if not clock_set_done:
+                                        # PLAYER'S HOUSE: Go upstairs to SET CLOCK
+                                        if action_name == 'UP':
+                                            directive_reward = 50.0
+                                            logger.info(f"⬆️ GOING UPSTAIRS TO SET CLOCK (+50) [{player_gender}]")
+                                        elif action_name == 'LEFT':
+                                            # LEFT towards stairs at (2,2)
+                                            directive_reward = 20.0
+                                        elif action_name in ['DOWN', 'RIGHT']:
+                                            directive_reward = -20.0  # Wrong direction
+                                    else:
+                                        # CLOCK done - should EXIT house, not go upstairs
+                                        if action_name == 'DOWN':
+                                            directive_reward = 30.0  # Reward exiting
+                                            logger.info(f"🚪 CLOCK DONE, EXIT HOUSE (+30) [{player_gender}]")
+                                        elif action_name == 'UP':
+                                            directive_reward = -30.0  # Penalize going upstairs again
+                                elif in_rival_house:
+                                    if not rival_bedroom_done:
+                                        # RIVAL'S HOUSE: Go upstairs to RIVAL BEDROOM
+                                        if action_name == 'UP':
+                                            directive_reward = 100.0  # Strong reward to go upstairs
+                                            logger.info(f"⬆️ GOING UPSTAIRS TO RIVAL BEDROOM (+100) [{player_gender}]")
+                                        elif action_name in ['DOWN', 'LEFT', 'RIGHT']:
+                                            directive_reward = -30.0  # Stronger penalty for wrong direction
+                                    else:
+                                        # RIVAL_BEDROOM done - should EXIT house
+                                        if action_name == 'DOWN':
+                                            directive_reward = 30.0  # Reward exiting
+                                            logger.info(f"🚪 RIVAL_BEDROOM DONE, EXIT HOUSE (+30) [{player_gender}]")
+                                        elif action_name == 'UP':
+                                            directive_reward = -30.0
+                                else:
+                                    # Generic house or unknown
+                                    if action_name == 'UP':
+                                        directive_reward = 30.0
+                                    elif action_name in ['DOWN']:
+                                        directive_reward = -10.0
                             
                             # EXIT_RIVAL_BEDROOM is now handled by EXIT_HOUSE logic above (lines 2790+)
                             # which uses SLAM pathfinding to stairs - NO LEGACY HANDLER NEEDED
@@ -3359,32 +6092,49 @@ def main():
                                 location_upper = (memory.get('location', '') or '').upper()
                                 
                                 # INSIDE POKECENTER: Go UP to Nurse Joy and press A!
+                                # EXCEPTION: On 2F, go DOWN to escalator to exit!
                                 if 'POKECENTER' in location_upper:
-                                    # Nurse Joy is at counter - typically at (7, 3) or similar
-                                    nurse_x, nurse_y = 7, 3  # Nurse Joy counter position
+                                    on_2f = '2F' in location_upper
                                     
-                                    # Check if at Nurse Joy counter (y <= 4)
-                                    at_nurse = current_y <= 4
-                                    
-                                    if at_nurse:
-                                        # At Nurse Joy - press A to heal!
-                                        if action_name == 'A':
-                                            directive_reward = 200.0  # Big reward for healing!
-                                            logger.info(f"💚 HEALING AT NURSE JOY! Position: ({current_x},{current_y})")
-                                        elif action_name == 'UP':
-                                            directive_reward = 50.0  # Still go up to get closer
-                                        else:
-                                            directive_reward = -10.0
-                                    else:
-                                        # Walk UP to Nurse Joy counter
-                                        if action_name == 'UP':
-                                            directive_reward = 100.0
+                                    if on_2f:
+                                        # ON 2F: Go DOWN to escalator to return to 1F!
+                                        if action_name == 'DOWN':
+                                            directive_reward = 100.0  # Correct direction to escalator!
                                             if self.step_count % 30 == 0:
-                                                logger.info(f"🏥 POKECENTER INTERIOR: Going UP to Nurse Joy")
+                                                logger.info(f"🪜 POKECENTER 2F: Going DOWN to escalator to exit!")
                                         elif action_name in ['LEFT', 'RIGHT']:
-                                            directive_reward = 10.0  # Slight reward for adjusting position
-                                        elif action_name == 'DOWN':
-                                            directive_reward = -50.0  # Don't exit!
+                                            directive_reward = 20.0  # Might need to navigate around
+                                        elif action_name == 'UP':
+                                            directive_reward = -50.0  # Wrong direction on 2F!
+                                        else:
+                                            directive_reward = 0.0
+                                    else:
+                                        # ON 1F: Normal nurse navigation
+                                        # Nurse Joy is at counter - typically at (7, 3) or similar
+                                        nurse_x, nurse_y = 7, 3  # Nurse Joy counter position
+                                        
+                                        # Check if at Nurse Joy counter (y <= 4)
+                                        at_nurse = current_y <= 4
+                                        
+                                        if at_nurse:
+                                            # At Nurse Joy - press A to heal!
+                                            if action_name == 'A':
+                                                directive_reward = 200.0  # Big reward for healing!
+                                                logger.info(f"💚 HEALING AT NURSE JOY! Position: ({current_x},{current_y})")
+                                            elif action_name == 'UP':
+                                                directive_reward = 50.0  # Still go up to get closer
+                                            else:
+                                                directive_reward = -10.0
+                                        else:
+                                            # Walk UP to Nurse Joy counter
+                                            if action_name == 'UP':
+                                                directive_reward = 100.0
+                                                if self.step_count % 30 == 0:
+                                                    logger.info(f"🏥 POKECENTER INTERIOR: Going UP to Nurse Joy")
+                                            elif action_name in ['LEFT', 'RIGHT']:
+                                                directive_reward = 10.0  # Slight reward for adjusting position
+                                            elif action_name == 'DOWN':
+                                                directive_reward = -50.0  # Don't exit!
                                 
                                 # If in Oldale TOWN (not PokeCenter), pathfind to PokeCenter door
                                 elif 'OLDALE' in location_upper:
@@ -3396,32 +6146,25 @@ def main():
                                     # Check if at PokeCenter door (within 2 tiles)
                                     at_pokecenter = abs(current_x - pc_x) <= 2 and abs(current_y - pc_y) <= 2
                                     
-                                    # Mark as visited when near PokeCenter door
+                                    # NOTE: Do NOT set visited flag here - this is just approaching the door!
+                                    # visited_oldale_pokecenter should ONLY be set when agent talks to Nurse Joy
+                                    # at (7,4) INSIDE the PokeCenter - handled in late-stage override
                                     if at_pokecenter:
-                                        if not hasattr(self, 'oldale_pokecenter_visited'):
-                                            self.oldale_pokecenter_visited = False
-                                        if not self.oldale_pokecenter_visited:
-                                            self.oldale_pokecenter_visited = True
-                                            logger.info(f"✅ OLDALE POKECENTER VISITED! Respawn point updated.")
-                                            # Sync milestone to server!
-                                            try:
-                                                requests.post("http://localhost:8000/milestone", 
-                                                    json={"name": "OLDALE_POKECENTER", "completed": True}, 
-                                                    timeout=1)
-                                            except Exception:
-                                                pass
-                                        
-                                        # Reward pressing A to enter
+                                        # Reward pressing A to enter PokeCenter
                                         if action_name == 'A':
                                             directive_reward = 300.0  # MASSIVE reward - critical for respawn!
                                             logger.info(f"🏥 ENTERING POKECENTER at ({current_x},{current_y})")
                                     else:
-                                        # Still pathfinding to PokeCenter
-                                        best_dir = get_best_direction(current_x, current_y, pc_x, pc_y)
+                                        # Still pathfinding to PokeCenter - USE A* oldale_target!
+                                        oldale_target = memory.get('oldale_target')
+                                        if oldale_target:
+                                            best_dir = oldale_target.get('action')
+                                        else:
+                                            best_dir = get_best_direction(current_x, current_y, pc_x, pc_y)
                                         if best_dir and action_name == best_dir:
                                             directive_reward = 200.0  # Huge reward - need respawn point!
                                             if self.step_count % 50 == 0:
-                                                logger.info(f"🏥 HEAL PATHFINDING: → Oldale PokeCenter ({pc_x},{pc_y})")
+                                                logger.info(f"🏥 HEAL A* PATHFINDING: → Oldale PokeCenter ({pc_x},{pc_y}) via {best_dir}")
                                         elif action_name in ['UP', 'DOWN', 'LEFT', 'RIGHT']:
                                             directive_reward = -10.0
                                 # If in Littleroot, go to Mom's house (she heals for free!)
@@ -3556,6 +6299,15 @@ def main():
                                     except:
                                         pass  # SNN not available, fall through
                                 
+                            # ═══════════════════════════════════════════════════════════════
+                            # 🚨 FINAL STUCK OVERRIDE - HIGHEST PRIORITY! Bypass all other logic
+                            # ═══════════════════════════════════════════════════════════════
+                            if getattr(self, '_forced_stuck_action', None):
+                                action_name = self._forced_stuck_action
+                                self._forced_stuck_action = None  # Clear for next step
+                                if self.step_count % 10 == 0:
+                                    logger.warning(f"🔥 FINAL STUCK OVERRIDE: Forcing {action_name} (bypassed all other logic)")
+                                
                             if directive_reward != 0:
                                 reward += directive_reward
                                 if self.step_count % 10 == 0:
@@ -3582,6 +6334,7 @@ def main():
                     # Check if in battle (suppress SLAM to save CPU/memory!)
                     game_state = memory.get('game_state', '').upper()
                     in_battle = game_state == 'BATTLE'
+                    self.cached_game_state = game_state  # Cache for battle override in next step()
                     
                     # Stuck detection: no position change for 30+ steps
                     # SUPPRESSED during battles (normal to be "stuck" at same position)
@@ -3739,8 +6492,96 @@ def main():
                             
                             self.last_hp_fraction = hp_fraction
                             self.last_party_size = len(party)
+                            
+                            # ===== RIVAL BATTLE REWARD INCENTIVES =====
+                            # Problem: Agent blacks out on Route 103 before reaching rival
+                            # Solution: Strong rewards for reaching rival with HP intact
+                            
+                            # 4a. RIVAL PROXIMITY BONUS (Route 103 only)
+                            if map_id == 0x12:  # Route 103
+                                rival_pos = (12, 3)  # Rival location
+                                current_dist = abs(x - rival_pos[0]) + abs(y - rival_pos[1])
+                                if not hasattr(self, 'last_rival_dist'):
+                                    self.last_rival_dist = current_dist
+                                if current_dist < self.last_rival_dist:
+                                    # Reward for getting closer to rival
+                                    approach_bonus = 50.0 * (self.last_rival_dist - current_dist)
+                                    reward += approach_bonus
+                                    info_parts.append(f"🎯 Rival approach +{approach_bonus:.0f}")
+                                self.last_rival_dist = current_dist
+                                
+                                # 4b. HP CONSERVATION BONUS (Route 103)
+                                # Encourage reaching rival with HP intact
+                                if hp_fraction > 0.5 and not hasattr(self, '_hp_conserve_logged'):
+                                    hp_conserve = 20.0 * hp_fraction
+                                    reward += hp_conserve
+                                    if self.step_count % 50 == 0:
+                                        info_parts.append(f"💪 HP conserve +{hp_conserve:.0f}")
+                            
+                            # 4c. LEVEL-UP BONUS (encourages grinding before rival)
+                            if party:
+                                lead_level = party[0].get('level', 5)
+                                if not hasattr(self, 'last_lead_level'):
+                                    self.last_lead_level = lead_level
+                                if lead_level > self.last_lead_level:
+                                    level_bonus = 500.0 * (lead_level - self.last_lead_level)
+                                    reward += level_bonus
+                                    info_parts.append(f"⬆️ LEVEL UP +{level_bonus:.0f}")
+                                    self.last_lead_level = lead_level
                     except:
                         pass
+                    
+                    # 4d. FIRST_RIVAL_BATTLE WIN MILESTONE BONUS
+                    if hasattr(self, 'completed_first_rival_battle_locally') and self.completed_first_rival_battle_locally:
+                        if not hasattr(self, '_rival_win_rewarded') or not self._rival_win_rewarded:
+                            rival_win_bonus = 1000.0
+                            reward += rival_win_bonus
+                            info_parts.append(f"🎉 RIVAL BATTLE WON +{rival_win_bonus:.0f}")
+                            self._rival_win_rewarded = True
+                    
+                    # 5. KNN EPISODIC MEMORY - Reward-based action bias (NeurIPS/CVPR 2024)
+                    # Query memory only when SNN is uncertain (event-driven sparse retrieval)
+                    try:
+                        if hasattr(self, 'episodic_memory'):
+                            # Build state key from current context
+                            state_key = np.zeros(32, dtype=np.float32)
+                            state_key[0] = x / 30.0  # Normalized position
+                            state_key[1] = y / 30.0
+                            state_key[2] = map_id / 256.0 if map_id else 0
+                            state_key[3] = hp_fraction if 'hp_fraction' in dir() else 0.5
+                            # Fill rest with milestone progress
+                            milestones_completed = set(game_data.get('milestones_completed', []))
+                            for i, m in enumerate(['STARTER_CHOSEN', 'OLDALE_TOWN', 'ROUTE_103', 'FIRST_RIVAL_BATTLE']):
+                                if i + 4 < 32:
+                                    state_key[i + 4] = 1.0 if m in milestones_completed else 0.0
+                            
+                            # SNN-gated query (only when uncertain)
+                            snn_confidence = getattr(self, 'snn_confidence', 0.5)
+                            knn_result = self.episodic_memory.query(state_key, map_id, snn_confidence)
+                            
+                            if not knn_result.get('skipped', True) and knn_result['confidence'] > 0.3:
+                                # Reward bias for matching remembered successful actions
+                                action_weights = knn_result['action_weights']
+                                if hasattr(self, 'last_action_idx'):
+                                    action_match = action_weights[self.last_action_idx]
+                                    if action_match > 0.3 and knn_result['avg_reward'] > 0:
+                                        knn_bonus = 10.0 * action_match * knn_result['confidence']
+                                        reward += knn_bonus
+                                        if self.step_count % 100 == 0:
+                                            info_parts.append(f"🧠 KNN +{knn_bonus:.1f}")
+                            
+                            # Store current experience and add exploration bonus
+                            if hasattr(self, 'last_action_idx'):
+                                is_novel = self.episodic_memory.store(state_key, self.last_action_idx, reward, map_id or 0)
+                                
+                                # Exploration bonus for discovering new states (PokemonRedExperiments style)
+                                if is_novel:
+                                    explore_bonus = self.episodic_memory.explore_weight * 10.0  # +0.1 per unique state
+                                    reward += explore_bonus
+                                    if self.step_count % 100 == 0:
+                                        info_parts.append(f"🔍 NOVEL +{explore_bonus:.1f} ({self.episodic_memory.unique_states})")
+                    except Exception as e:
+                        pass  # Don't crash if KNN fails
                     
                     # 3. OPPONENT LEVEL TRACKING (Reward fighting stronger trainers)
                     try:
@@ -3794,6 +6635,23 @@ def main():
                                 should_run = True
                                 run_reason = "Early game speedrun"
                             
+                            # ═══════════════════════════════════════════════════════════════════
+                            # 🏃 ROUTE 103 STRATEGY: RUN from wild battles, FIGHT rival trainer!
+                            # Wild battles waste time - RUN to reach rival faster
+                            # Rival trainer battle = MUST FIGHT to complete FIRST_RIVAL_BATTLE milestone
+                            # Note: You can't run from trainer battles anyway, so this is just for wild
+                            # ═══════════════════════════════════════════════════════════════════
+                            if map_id == 0x12:  # Route 103
+                                if is_wild:
+                                    should_run = True  # RUN from wild battles to reach rival faster!
+                                    run_reason = "Route 103 - rushing to rival!"
+                                    if self.step_count % 50 == 0:
+                                        logger.info("🏃 ROUTE 103: Running from wild battle to reach rival faster!")
+                                else:
+                                    should_run = False  # FIGHT trainer (rival) battle!
+                                    if self.step_count % 50 == 0:
+                                        logger.info("⚔️ ROUTE 103 RIVAL BATTLE! MUST FIGHT to get Pokédex!")
+                            
                             # Apply RUN reward/penalty - STRONG incentive to run!
                             if should_run:
                                 # Reward running (DOWN+RIGHT to reach RUN, then A to select)
@@ -3803,6 +6661,23 @@ def main():
                                         logger.info(f"🏃 RUN encouraged: {run_reason}")
                                 elif action_name == 'A':
                                     reward -= 20.0  # Strong penalty for attacking when should run
+                            else:
+                                # ═══════════════════════════════════════════════════════════════════
+                                # ⚔️ FIGHT REWARDS: Strongly reward attacking in trainer battles!
+                                # Especially important for Route 103 rival battle to advance story!
+                                # ═══════════════════════════════════════════════════════════════════
+                                if action_name == 'A':
+                                    reward += 100.0  # Strong reward for attacking!
+                                    if map_id == 0x12:  # Extra bonus for Route 103 rival
+                                        reward += 200.0  # HUGE bonus - this is the critical story battle!
+                                        if self.step_count % 30 == 0:
+                                            logger.info("⚔️ FIGHTING RIVAL! A button +300 reward!")
+                                elif action_name in ['RIGHT', 'DOWN']:
+                                    # Penalty for trying to run when should fight
+                                    if map_id == 0x12:
+                                        reward -= 100.0  # Strong penalty for running from rival!
+                                        if self.step_count % 30 == 0:
+                                            logger.info("🚫 NO RUNNING from rival battle! -100")
                             
                             # Level tracking (existing logic)
                             if not hasattr(self, 'max_opponent_level'):
@@ -4739,6 +7614,169 @@ quest_steps: [STEP1 → STEP2 → STEP3 or SINGLE]
             """Get milestone state as vector for SNN"""
             return list(self.milestones.values()) + [self.story_phase / 5.0]  # Normalize phase
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SPARSE EPISODIC MEMORY - Lightweight KNN for Edge SNN (NeurIPS/CVPR 2024)
+    # Memory: ~100KB (fits in L2 cache)
+    # Features: FP16 storage, SNN-gated queries, reward-based action bias
+    # ═══════════════════════════════════════════════════════════════════════════
+    class SparseEpisodicMemory:
+        """
+        Memory-efficient episodic KNN for edge SNN.
+        Based on NeurIPS 2024 FEEL-SNN and CVPR 2024 hybrid SNN research.
+        
+        Memory budget: ~100KB
+        - 1000 entries × 32-dim keys (FP16) = 64KB
+        - 1000 × 8 action weights (FP16) = 16KB  
+        - 1000 rewards + metadata = ~20KB
+        """
+        def __init__(self, max_entries: int = 1000, key_dim: int = 32, k: int = 5):
+            self.max_entries = max_entries
+            self.key_dim = key_dim
+            self.k = k
+            self.count = 0
+            
+            # FP16 storage for memory efficiency (from CVPR 2024 quantization research)
+            self.keys = np.zeros((max_entries, key_dim), dtype=np.float16)
+            self.actions = np.zeros((max_entries, 8), dtype=np.float16)  # 8 game actions
+            self.rewards = np.zeros(max_entries, dtype=np.float16)
+            self.map_ids = np.zeros(max_entries, dtype=np.int16)
+            
+            # SNN-gated query threshold (from NeurIPS FEEL-SNN)
+            self.query_threshold = 0.3  # Only query when SNN confidence < this
+            self.last_confidence = 0.0
+            
+            # Exploration bonus (inspired by PokemonRedExperiments)
+            self.unique_states = 0  # Count of unique states discovered
+            self.similar_state_dist = 0.3  # Similarity threshold (like sim_frame_dist)
+            self.explore_weight = 0.01  # Reward per unique state
+            
+            logger.info(f"🧠 SparseEpisodicMemory initialized: {max_entries} entries × {key_dim}D (FP16)")
+            logger.info(f"   Memory usage: ~{(max_entries * key_dim * 2 + max_entries * 8 * 2 + max_entries * 4) / 1024:.1f}KB")
+            logger.info(f"   Exploration: +{self.explore_weight:.3f} per unique state (threshold={self.similar_state_dist})")
+        
+        def store(self, state_key: np.ndarray, action_idx: int, reward: float, map_id: int) -> bool:
+            """
+            Store experience with FP16 compression.
+            Returns True if this was a NOVEL state (for exploration reward).
+            Inspired by PokemonRedExperiments update_frame_knn_index().
+            """
+            # Normalize key
+            key_norm = state_key[:self.key_dim].astype(np.float16)
+            key_norm = key_norm / (np.linalg.norm(key_norm) + 1e-8)
+            
+            is_novel = False
+            
+            # Check if state is novel (PokemonRedExperiments style)
+            if self.count == 0:
+                is_novel = True
+            else:
+                # Query nearest neighbor
+                valid_count = min(self.count, self.max_entries)
+                distances = np.linalg.norm(self.keys[:valid_count] - key_norm, axis=1)
+                min_dist = np.min(distances)
+                
+                # Only add if sufficiently different from all stored states
+                if min_dist > self.similar_state_dist:
+                    is_novel = True
+            
+            # Only store if novel (to maximize diversity like PokemonRedExperiments)
+            if is_novel:
+                # Circular buffer for fixed memory
+                idx = self.count % self.max_entries
+                self.keys[idx] = key_norm
+                
+                # One-hot action
+                action_vec = np.zeros(8, dtype=np.float16)
+                action_vec[min(action_idx, 7)] = 1.0
+                self.actions[idx] = action_vec
+                
+                # Store reward and map
+                self.rewards[idx] = np.float16(reward)
+                self.map_ids[idx] = np.int16(map_id)
+                
+                self.count += 1
+                self.unique_states += 1
+            
+            return is_novel
+        
+        def get_exploration_reward(self) -> float:
+            """Get exploration bonus based on unique states discovered.
+            Inspired by PokemonRedExperiments get_knn_reward().
+            """
+            return self.explore_weight * self.unique_states
+        
+        def query(self, state_key: np.ndarray, map_id: int = None, snn_confidence: float = 1.0) -> dict:
+            """
+            SNN-gated KNN query - only runs when SNN is uncertain.
+            Returns action bias weights for reward-based learning.
+            """
+            self.last_confidence = snn_confidence
+            
+            # Skip query if SNN is confident (event-driven sparse retrieval)
+            if snn_confidence > self.query_threshold:
+                return {'action_weights': np.ones(8, dtype=np.float32) / 8, 
+                        'avg_reward': 0.0, 'confidence': 0.0, 'skipped': True}
+            
+            if self.count == 0:
+                return {'action_weights': np.ones(8, dtype=np.float32) / 8,
+                        'avg_reward': 0.0, 'confidence': 0.0, 'skipped': False}
+            
+            # Normalize query
+            query_key = state_key[:self.key_dim].astype(np.float16)
+            query_key = query_key / (np.linalg.norm(query_key) + 1e-8)
+            
+            # Compute distances (vectorized for speed)
+            valid_count = min(self.count, self.max_entries)
+            distances = np.linalg.norm(self.keys[:valid_count] - query_key, axis=1)
+            
+            # Filter by map if provided
+            if map_id is not None:
+                map_mask = self.map_ids[:valid_count] == map_id
+                if map_mask.sum() >= self.k:
+                    distances[~map_mask] = np.inf
+            
+            # Get k nearest
+            k_indices = np.argpartition(distances, min(self.k, valid_count - 1))[:self.k]
+            k_distances = distances[k_indices]
+            
+            # Compute weights (inverse distance)
+            weights = 1.0 / (k_distances + 0.1)
+            weights = weights / weights.sum()
+            
+            # Weighted action distribution (reward-based, not override)
+            action_weights = np.zeros(8, dtype=np.float32)
+            for i, idx in enumerate(k_indices):
+                action_weights += weights[i] * self.actions[idx].astype(np.float32)
+            
+            # Average reward for value estimation
+            avg_reward = np.sum(weights * self.rewards[k_indices].astype(np.float32))
+            
+            # Confidence based on distance (closer = more confident)
+            confidence = min(1.0, np.mean(weights) * 10)
+            
+            return {
+                'action_weights': action_weights,
+                'avg_reward': float(avg_reward),
+                'confidence': float(confidence),
+                'skipped': False
+            }
+        
+        def get_stats(self) -> dict:
+            """Get memory statistics."""
+            return {
+                'entries': min(self.count, self.max_entries),
+                'max_entries': self.max_entries,
+                'memory_kb': (self.max_entries * self.key_dim * 2 + 
+                              self.max_entries * 8 * 2 + 
+                              self.max_entries * 4) / 1024,
+                'last_confidence': self.last_confidence
+            }
+    
+    # Initialize episodic memory
+    episodic_memory = SparseEpisodicMemory(max_entries=1000, key_dim=32, k=5)
+    env.episodic_memory = episodic_memory
+    logger.info("✅ SparseEpisodicMemory attached to env")
+    
     milestone_tracker = MilestoneStateTracker()
     vlm_guidance_tracker = VLMGuidanceTracker()
     spatial_map_tracker = SpatialMapTracker()
@@ -4779,6 +7817,37 @@ quest_steps: [STEP1 → STEP2 → STEP3 or SINGLE]
     from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
     import torch
     import torch.nn as nn
+    
+    # ===== ADAPTIVE SURROGATE GRADIENT (NeurIPS 2024 inspired) =====
+    # Makes spike generation differentiable for gradient-based learning
+    class AdaptiveSurrogateSpike(torch.autograd.Function):
+        """Spike function with adaptive surrogate gradient.
+        
+        Forward: Hard threshold (Heaviside step)
+        Backward: Differentiable surrogate with learnable slope
+        
+        Reference: "Adaptive Surrogate Gradients for Sequential RL in SNNs" NeurIPS 2024
+        """
+        @staticmethod
+        def forward(ctx, membrane, threshold, slope):
+            """Forward pass: spike if membrane > threshold"""
+            spikes = (membrane > threshold).float()
+            ctx.save_for_backward(membrane, threshold, slope)
+            return spikes
+        
+        @staticmethod
+        def backward(ctx, grad_output):
+            """Backward pass: smooth surrogate gradient"""
+            membrane, threshold, slope = ctx.saved_tensors
+            # Adaptive surrogate gradient: sigmoid derivative with learnable slope
+            # slope controls sharpness: higher = sharper approximation to Heaviside
+            diff = membrane - threshold
+            surrogate_grad = slope * torch.sigmoid(slope * diff) * (1 - torch.sigmoid(slope * diff))
+            return grad_output * surrogate_grad, None, None
+    
+    def spike_fn(membrane, threshold, slope):
+        """Wrapper for AdaptiveSurrogateSpike"""
+        return AdaptiveSurrogateSpike.apply(membrane, threshold, slope)
     
     # Hierarchical Architecture: SNN as Central Temporal Core
     class StoryDrivenCNNSNNExtractor(BaseFeaturesExtractor):
@@ -4939,6 +8008,19 @@ quest_steps: [STEP1 → STEP2 → STEP3 or SINGLE]
             # SNN LIF neuron parameters (learnable)
             self.snn_threshold = nn.Parameter(torch.ones(snn_hidden_dim) * 0.5)
             self.snn_decay = nn.Parameter(torch.ones(snn_hidden_dim) * 0.8)
+            
+            # ADAPTIVE SURROGATE: Learnable slope for spike gradient (NeurIPS 2024)
+            # Higher slope = sharper spike approximation, lower = smoother gradients
+            self.snn_surrogate_slope = nn.Parameter(torch.ones(1) * 5.0)
+            
+            # SYNAPTIC DELAYS: Buffer for temporal offset learning
+            # Different inputs arrive with different delays (3-step max)
+            # This helps capture "X happens BEFORE Y" relationships
+            self.synaptic_delay_steps = 3
+            self.register_buffer('synaptic_delay_buffer', torch.zeros(1, snn_hidden_dim, self.synaptic_delay_steps))
+            
+            # Learnable delay weights per input source (7 sources)
+            self.delay_weights = nn.Parameter(torch.ones(7, self.synaptic_delay_steps) / self.synaptic_delay_steps)
             
             # SNN state (temporal memory across timesteps)
             self.register_buffer('snn_membrane', torch.zeros(1, snn_hidden_dim))
@@ -5128,14 +8210,6 @@ quest_steps: [STEP1 → STEP2 → STEP3 or SINGLE]
             
             # ===== SNN CORE: INTEGRATE ALL 7 INPUTS =====
             # Concatenate all input streams into SNN input current
-            # This is the central temporal reasoning that integrates:
-            # - What should I do? (VLM goals)
-            # - Where am I in the story? (Milestones)
-            # - What quest am I on? (Structured objectives from dialog)
-            # - What do I see? (CNN vision)
-            # - Where am I? (Grid/Map position)
-            # - What's walkable? (Map-based terrain)
-            # - Trees vs grass? (Pixel-based RGB analysis)
             snn_input_current = torch.cat([
                 vlm_input,        # 64 neurons: High-level goals
                 milestone_input,  # 64 neurons: Story flags
@@ -5146,20 +8220,51 @@ quest_steps: [STEP1 → STEP2 → STEP3 or SINGLE]
                 rgb_input         # 64 neurons: Pixel-based tree/grass detection
             ], dim=1)  # Total: 448 neurons (7 × 64)
             
-            # LIF dynamics: V(t+1) = decay * V(t) + I(t)
-            # SNN integrates information over time (event memory, temporal patterns)
-            self.snn_membrane = self.snn_decay * self.snn_membrane + snn_input_current
+            # ===== SYNAPTIC DELAYS: Process temporal offsets =====
+            # Store current input in delay buffer
+            if self.synaptic_delay_buffer.shape[0] != batch_size:
+                self.synaptic_delay_buffer = torch.zeros(
+                    batch_size, self.synaptic_delay_buffer.shape[1], self.synaptic_delay_steps,
+                    device=observations.device, dtype=observations.dtype
+                )
             
-            # Spike generation: spike if V > threshold
-            spikes = (self.snn_membrane > self.snn_threshold).float()
+            # Roll buffer and add new input
+            self.synaptic_delay_buffer = torch.roll(self.synaptic_delay_buffer, shifts=1, dims=2)
+            self.synaptic_delay_buffer[:, :, 0] = snn_input_current
             
-            # Reset membrane where spikes occurred
+            # Apply learnable delay weights (soft attention over delay steps)
+            # Each of 7 sources has different temporal importance
+            delay_weights_normalized = torch.softmax(self.delay_weights, dim=1)  # (7, 3)
+            
+            # Compute weighted sum over delays for each source (64 neurons each)
+            delayed_input = torch.zeros_like(snn_input_current)
+            source_size = 64
+            for i in range(7):
+                start_idx = i * source_size
+                end_idx = (i + 1) * source_size
+                # Weight past inputs for this source
+                weighted_delay = torch.zeros(batch_size, source_size, device=observations.device)
+                for delay_step in range(self.synaptic_delay_steps):
+                    weighted_delay += delay_weights_normalized[i, delay_step] * \
+                                     self.synaptic_delay_buffer[:, start_idx:end_idx, delay_step]
+                delayed_input[:, start_idx:end_idx] = weighted_delay
+            
+            # LIF dynamics: V(t+1) = decay * V(t) + I(t) with delays
+            # SNN integrates delayed information over time (temporal pattern learning)
+            self.snn_membrane = self.snn_decay * self.snn_membrane + delayed_input
+            
+            # ===== ADAPTIVE SURROGATE SPIKE (NeurIPS 2024) =====
+            # Use differentiable spike function for gradient-based learning
+            # Forward: hard threshold, Backward: smooth surrogate gradient
+            spikes = spike_fn(self.snn_membrane, self.snn_threshold, self.snn_surrogate_slope)
+            
+            # Reset membrane where spikes occurred (soft reset proportional to spike)
             self.snn_membrane = self.snn_membrane * (1.0 - spikes)
             
             # Update spike history (rolling window of last 10 timesteps)
             # This is the temporal memory: "what happened in last N seconds?"
-            self.snn_spike_history = torch.roll(self.snn_spike_history, shifts=-1, dims=2)
-            self.snn_spike_history[:, :, -1] = spikes
+            self.snn_spike_history = torch.roll(self.snn_spike_history.detach(), shifts=-1, dims=2)
+            self.snn_spike_history[:, :, -1] = spikes.detach()  # Detach to prevent backward graph reuse
             
             # Aggregate spike history for temporal reasoning features
             snn_temporal_features = self.snn_spike_history.mean(dim=2)
